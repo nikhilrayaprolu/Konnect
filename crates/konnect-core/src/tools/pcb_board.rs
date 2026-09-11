@@ -1243,6 +1243,40 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
         tool!(
+            "query_zones",
+            "List copper zones on the board, optionally filtered by net. Each result \
+             includes the zone's UUID, which delete_zone takes, plus its name, layers, and \
+             fill status.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string" },
+                    "net_name": { "type": "string", "description": "Filter by net (optional)" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_query_zones(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "delete_zone",
+            "Delete a copper zone identified by its UUID via KiCAD IPC. Refuses UUIDs that \
+             are not observed zones on the requested board, then verifies the zone is absent \
+             before reporting success. Returns the observed preimage and postcondition. Use \
+             this to remove a premature or unwanted copper pour (e.g. an outer-layer fill \
+             poured before routing was complete) without touching other zones.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid":  { "type": "string", "description": "UUID of the zone to delete" }
+                },
+                "required": ["board", "uuid"]
+            }),
+            |args, ctx| async move { handle_delete_zone(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "import_svg_logo",
             "Import an SVG file as filled silkscreen or copper artwork (a logo, icon, or other \
              graphic). Curved paths are flattened into polygon outlines since KiCAD's board \
@@ -2365,6 +2399,97 @@ async fn handle_add_zone(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     add_zone_impl(args, ctx).await
+}
+
+async fn handle_query_zones(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let net = args["net_name"].as_str().map(String::from);
+
+    let net_ipc = net.clone();
+    let zones = match with_board_ipc_classified(ctx, &board_path, move |c| {
+        c.get_zones(net_ipc.as_deref())
+    })
+    .await?
+    {
+        Ok(zones) => zones,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                error.message()
+            )))
+        }
+    };
+
+    let items: Vec<serde_json::Value> = zones
+        .iter()
+        .map(|z| {
+            json!({
+                "uuid": z.uuid,
+                "name": z.name,
+                "net": z.net_name,
+                "layers": z.layers,
+                "filled": z.filled
+            })
+        })
+        .collect();
+
+    Ok(CallToolResult::json(&json!({
+        "count": items.len(),
+        "zones": items
+    })))
+}
+
+async fn handle_delete_zone(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+
+    let board_ipc = board_path.clone();
+    let uuid_ipc = uuid.clone();
+    let deleted = match with_board_ipc_classified(ctx, &board_path, move |client| {
+        client.delete_zone_verified(&board_ipc, &uuid_ipc)
+    })
+    .await?
+    {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                error.message()
+            )))
+        }
+    };
+
+    let Some(zone) = deleted else {
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed zone on the requested board".to_string(),
+            },
+            "The requested UUID is not a zone on the requested board. No board item was deleted.",
+        ));
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "deleted_uuid": zone.uuid,
+        "deleted_type": "zone",
+        "preimage": {
+            "uuid": zone.uuid,
+            "name": zone.name,
+            "net": zone.net_name,
+            "layers": zone.layers,
+            "filled": zone.filled
+        },
+        "postcondition": "absent_from_zone_readback"
+    })))
 }
 
 async fn handle_import_svg_logo(

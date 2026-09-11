@@ -43,6 +43,33 @@ fn via_type_name(via_type: i32) -> &'static str {
     }
 }
 
+/// Decode a raw `Zone` protobuf into the [`IpcZone`] read model.
+fn decode_zone(zone: &kiapi::board::types::Zone) -> IpcZone {
+    let uuid = zone
+        .id
+        .as_ref()
+        .map(|id| id.value.clone())
+        .unwrap_or_default();
+    let net_name = match &zone.settings {
+        Some(kiapi::board::types::zone::Settings::CopperSettings(copper)) => {
+            copper.net.as_ref().map(|n| n.name.clone()).unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    let layers = zone
+        .layers
+        .iter()
+        .map(|&l| layer_enum_to_name(l).to_string())
+        .collect();
+    IpcZone {
+        uuid,
+        name: zone.name.clone(),
+        net_name,
+        layers,
+        filled: zone.filled,
+    }
+}
+
 /// Decode a raw `Via` protobuf into the [`IpcVia`] read model.
 fn decode_via(via: &kiapi::board::types::Via) -> IpcVia {
     let uuid = via
@@ -2315,6 +2342,73 @@ impl KiCadIpcClient {
             );
         }
         Ok(Some(via))
+    }
+
+    /// Query zones, optionally filtered by net.
+    pub fn get_zones(&self, net_filter: Option<&str>) -> Result<Vec<IpcZone>> {
+        self.get_zones_in(self.get_board_document()?, net_filter)
+    }
+
+    /// As [`Self::get_zones`], targeting one exact open document.
+    pub fn get_zones_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_filter: Option<&str>,
+    ) -> Result<Vec<IpcZone>> {
+        let items =
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbZone)?;
+        let mut zones = Vec::new();
+        for item in &items {
+            // KOT_PCB_ZONE is its own object type (see the KOT_PCB_VIA fix
+            // above — don't assume a family selector without checking the
+            // proto enum). Still type-check before decode as a defensive
+            // measure.
+            if !crate::builders::any_is(item, "kiapi.board.types.Zone") {
+                continue;
+            }
+            let Ok(zone) = kiapi::board::types::Zone::decode(item.value.as_slice()) else {
+                continue;
+            };
+            let decoded = decode_zone(&zone);
+            if let Some(nf) = net_filter {
+                if decoded.net_name != nf {
+                    continue;
+                }
+            }
+            zones.push(decoded);
+        }
+        Ok(zones)
+    }
+
+    /// Delete one observed zone from the requested board, verifying its
+    /// absence from a fresh zone read-back before reporting success — the
+    /// same get→prove→delete→verify pattern as
+    /// [`Self::delete_via_verified`]/[`Self::delete_trace_segment_verified`].
+    pub fn delete_zone_verified(&self, requested: &Path, uuid: &str) -> Result<Option<IpcZone>> {
+        let document = self.find_open_board(requested)?;
+        let before = self.get_zones_in(document.clone(), None)?;
+        let Some(zone) = before.into_iter().find(|zone| zone.uuid == uuid) else {
+            return Ok(None);
+        };
+
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = self
+            .get_zones_in(document, None)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted deletion of zone '{}' but post-delete read-back failed; the deletion may have committed",
+                    uuid
+                )
+            })?
+            .into_iter()
+            .any(|candidate| candidate.uuid == uuid);
+        if remains {
+            anyhow::bail!(
+                "KiCad accepted deletion of zone '{}' but read-back still reports it",
+                uuid
+            );
+        }
+        Ok(Some(zone))
     }
 
     /// Move one observed via to a new position on the requested board.

@@ -431,6 +431,23 @@ pub struct IpcVia {
     pub via_type: String,
 }
 
+/// A copper zone read back from KiCad — a filled pour or keepout area.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcZone {
+    /// KIID of the zone, needed to delete it via delete_zone. Empty only if
+    /// KiCAD returned a zone without an id.
+    pub uuid: String,
+    /// User-assigned zone name (e.g. "GND_POUR_FCU"), empty if unnamed.
+    pub name: String,
+    /// Net name for a copper zone, "" for a keepout/rule-area zone which has
+    /// no net.
+    pub net_name: String,
+    /// Board layers this zone spans (e.g. ["F.Cu"], or multiple for a zone
+    /// drawn across several layers at once).
+    pub layers: Vec<String>,
+    pub filled: bool,
+}
+
 /// A graphic item inside a placed footprint — silkscreen, fabrication, or
 /// courtyard artwork, not a pad.
 ///
