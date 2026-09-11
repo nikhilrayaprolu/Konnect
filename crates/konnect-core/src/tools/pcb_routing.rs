@@ -2,6 +2,15 @@
 //!
 //! Routing operations use the KiCAD IPC API; `add_net`, `create_netclass`, and
 //! `add_copper_pour` use S-expression file manipulation.
+//!
+//! `route_trace`, `route_pad_to_pad`, `add_via`, and `route_differential_pair`
+//! (the actual copper-mutating tools) each call
+//! `phase_gate::require_phase_at_least(board, Phase::CriticalRouting)` before
+//! doing anything else, refusing with a structured `phase_gate_blocked` error
+//! if the project's persisted workflow phase (`.konnect/phase_state.json`)
+//! hasn't reached `critical_routing` yet. This is a deliberately narrow
+//! enforcement surface — see `tools/phase_gate.rs`'s module doc for why only
+//! these four tools are gated and not the other 220+ in this server.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -17,6 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use super::cli;
+use super::phase_gate::{require_phase_at_least, Phase};
 
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
@@ -367,6 +377,10 @@ async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_for_gate = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_for_gate, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -408,6 +422,9 @@ async fn handle_route_pad_to_pad(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_path, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -516,6 +533,10 @@ async fn handle_add_via(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_for_gate = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_for_gate, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1761,6 +1782,10 @@ async fn handle_route_diff_pair(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_for_gate = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_for_gate, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_pos = match require_str(args, "net_pos") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),

@@ -2310,7 +2310,7 @@ async fn handle_get_schematic_component(
     })))
 }
 
-async fn handle_list_schematic_components(
+pub(crate) async fn handle_list_schematic_components(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {

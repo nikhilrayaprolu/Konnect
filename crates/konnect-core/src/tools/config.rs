@@ -404,7 +404,7 @@ async fn handle_save_project_config(
     ))
 }
 
-async fn handle_get_effective_config(
+pub(crate) async fn handle_get_effective_config(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {

@@ -68,7 +68,7 @@ Konnect/
 │   │           ├── stdio.rs         # Line-by-line JSON-RPC over stdin/stdout (default)
 │   │           └── http.rs          # Streamable HTTP: POST + GET (SSE) on /mcp (transport = "http" / "both")
 │   │
-│   ├── konnect-core/          # All tool logic (21 toolsets)
+│   ├── konnect-core/          # All tool logic (23 toolsets)
 │   │   └── src/
 │   │       ├── mcp/
 │   │       │   ├── protocol.rs      # MCP JSON-RPC 2.0 types
@@ -265,6 +265,7 @@ Tool-call failures are typed via the `ToolErrorKind` enum in `crates/konnect-cor
 | `stale_target` | A previously bound PCB document is no longer uniquely open, saved symbol instance metadata disagrees with the proven hierarchy, or component readback lacks the expected document, UUID/reference, unit, library, hierarchy, position, rotation, or property value — carries `target` and `reason`; preflight refuses before writing, while a readback failure may follow a committed write |
 | `ambiguous_open_board` | KiCad answered, and its open-document list could not be read as a complete set of comparable board identities — carries `path`; neither the live nor the file path may run |
 | `handler_error` | Catch-all for unmigrated `anyhow::Error` returns |
+| `phase_gate_blocked` | A routing mutation ran before `phase_gate`'s `advance_phase` reached the required phase, or `advance_phase` itself refused because its target phase's gate criteria are unmet — carries `current_phase`, `required_phase`, `unmet_criteria`; `advance_phase(force: true, reason: "...")` is the recorded escape hatch |
 
 ### Producing structured errors in a handler
 
@@ -320,7 +321,7 @@ Source: [`crates/konnect-core/src/observability.rs`](crates/konnect-core/src/obs
 
 ## Tool Routing (Starter Kit + On-Demand Loading)
 
-The server does NOT expose all 226 tools (233 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
+The server does NOT expose all 233 tools (240 total with the 7 meta-tools) in `tools/list` by default — that would cost ~23K tokens of context on every listing. Instead:
 
 - **Startup**: only `STARTER_KIT` toolsets are pre-loaded (see `router/registry.rs::STARTER_KIT`). Currently: `project`, `config`. Combined with the 7 meta-tools, baseline `tools/list` is 21 tools ≈ 2K tokens.
 - **On demand**: the LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose a toolset's tools in subsequent `tools/list` responses. `unload_toolset(name)` prunes them when the task shifts.
@@ -395,12 +396,12 @@ convention for other `kicad-cli`-calling code.
 
 ## Current Stats
 
-- **21 toolsets, 226 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
+- **23 toolsets, 233 tools** + 7 meta-tools (4 routing + 2 observability + 1 runtime diagnostic — see `tool-directory.md`)
 - The standalone Unix executable adds one conditional stdio maintenance meta-tool,
   `reload_server`; it is not registered for an embedded server, HTTP, mixed
   transport, or Windows.
 - Baseline `tools/list`: 21 tools / ~2K tokens (starter kit + meta-tools)
-- Full-catalog `tools/list` (all loaded): 233 tools (226 registered + 7 meta) / ~25K tokens
+- Full-catalog `tools/list` (all loaded): 240 tools (233 registered + 7 meta) / ~25K tokens
 - **0 IPC stubs** (all protobuf methods implemented)
 - **0 unimplemented tools**
 - **Specctra DSN/SES are PCB-editor operations**, not `kicad-cli` commands.

@@ -144,6 +144,18 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         category: "manufacturing",
         tool_count: 3,
     },
+    ToolsetMeta {
+        name: "design_intent",
+        description: "Persisted engineering intent: functional blocks, interfaces, net priorities, decision log, and a heuristic sheet/net-cluster analysis draft",
+        category: "design_intent",
+        tool_count: 5,
+    },
+    ToolsetMeta {
+        name: "phase_gate",
+        description: "Phase-gated workflow state (analysis→floorplan→placement→critical_routing→routing→planes→verification) that routing tools refuse to skip past without a recorded override",
+        category: "design_intent",
+        tool_count: 2,
+    },
 ];
 
 /// Return the ToolDefs for a given toolset name, or None if unknown.
@@ -171,6 +183,8 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "design_review" => Some(design_review::tools()),
         "templates" => Some(templates::tools()),
         "manufacturing" => Some(manufacturing::tools()),
+        "design_intent" => Some(design_intent::tools()),
+        "phase_gate" => Some(phase_gate::tools()),
         _ => None,
     }
 }
