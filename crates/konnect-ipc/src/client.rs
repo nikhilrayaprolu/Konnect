@@ -2256,13 +2256,15 @@ impl KiCadIpcClient {
         net_filter: Option<&str>,
     ) -> Result<Vec<IpcVia>> {
         let items =
-            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbTrace)?;
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbVia)?;
         let mut vias = Vec::new();
         for item in &items {
-            // KOT_PCB_TRACE is a family selector that also returns straight
-            // Track segments and Arcs, and protobuf decoding is permissive
-            // enough to accept compatible bytes under the wrong declared
-            // type. Type-check before decode (see get_tracks_in).
+            // KOT_PCB_VIA is its own object type, distinct from
+            // KOT_PCB_TRACE (tracks/arcs) — confirmed against a real board:
+            // querying KOT_PCB_TRACE and filtering for a Via-typed Any
+            // returns nothing, vias only come back under KOT_PCB_VIA. Still
+            // type-check before decode in case KiCad's family boundaries
+            // shift again.
             if !crate::builders::any_is(item, "kiapi.board.types.Via") {
                 continue;
             }
@@ -2337,7 +2339,7 @@ impl KiCadIpcClient {
         let document = self.find_open_board(requested)?;
         let items = self.get_items_in(
             document.clone(),
-            kiapi::common::types::KiCadObjectType::KotPcbTrace,
+            kiapi::common::types::KiCadObjectType::KotPcbVia,
         )?;
         let mut target: Option<kiapi::board::types::Via> = None;
         for item in &items {
