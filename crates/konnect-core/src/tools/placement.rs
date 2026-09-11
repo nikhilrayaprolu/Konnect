@@ -160,7 +160,7 @@ const CONNECTOR_EDGE_LIMIT_MM: f64 = 10.0;
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
-async fn handle_score_placement(
+pub(crate) async fn handle_score_placement(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {

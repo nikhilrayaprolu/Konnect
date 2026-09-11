@@ -112,6 +112,17 @@ pub enum ToolErrorKind {
     /// Catch-all for handler `anyhow::Error` that hasn't been migrated yet.
     /// Eventually each variant above subsumes a subset of these.
     HandlerError { reason: String },
+    /// A mutation was refused because the project's phase-gated workflow
+    /// (`phase_gate` toolset) has not reached the phase this tool requires,
+    /// or `advance_phase` itself refused because its target phase's gate
+    /// criteria are unmet. `unmet_criteria` names each failing check;
+    /// `advance_phase(force: true, reason: "...")` is the deliberate escape
+    /// hatch, recorded in `phase_state.json`'s `overrides`.
+    PhaseGateBlocked {
+        current_phase: String,
+        required_phase: String,
+        unmet_criteria: Vec<String>,
+    },
 }
 
 impl ToolErrorKind {
@@ -137,6 +148,7 @@ impl ToolErrorKind {
             Self::UnsafeFileFallback { .. } => "unsafe_file_fallback",
             Self::AmbiguousOpenBoard { .. } => "ambiguous_open_board",
             Self::HandlerError { .. } => "handler_error",
+            Self::PhaseGateBlocked { .. } => "phase_gate_blocked",
         }
     }
 }
@@ -304,6 +316,11 @@ mod tests {
             },
             ToolErrorKind::AmbiguousOpenBoard { path: "p".into() },
             ToolErrorKind::HandlerError { reason: "r".into() },
+            ToolErrorKind::PhaseGateBlocked {
+                current_phase: "analysis".into(),
+                required_phase: "critical_routing".into(),
+                unmet_criteria: vec!["score_placement verdict is hard_fail".into()],
+            },
         ];
         for kind in kinds {
             let code = kind.short_code();

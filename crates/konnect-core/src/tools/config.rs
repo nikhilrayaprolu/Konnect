@@ -425,7 +425,10 @@ pub(crate) async fn effective_config_value(
     deep_merge(&user_config, &project_config)
 }
 
-async fn handle_get_effective_config(
+/// `pub(crate)` (rather than private, like most other tool handlers) so
+/// `design_intent::handle_analyze_design` can call it directly instead of
+/// re-implementing the user+project config merge.
+pub(crate) async fn handle_get_effective_config(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
