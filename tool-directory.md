@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **226 registered tools** + **7 always-visible meta-tools** = **233 total**
+- **231 registered tools** + **7 always-visible meta-tools** = **238 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -277,7 +277,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 15 tools
+### `pcb_routing` · 20 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -298,6 +298,11 @@ and Windows servers do not.
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Reads the `.kicad_pro` and the board file, so KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
+| `delete_via` | Delete one observed via by UUID via KiCad IPC. Refuses a trace segment's UUID or a stale UUID before deletion (vias and traces share KiCad's KOT_PCB_TRACE family selector), targets the requested board, and reports the observed preimage only after readback proves the via is absent. |
+| `move_via` | Move one observed via to a new position via KiCad IPC. Refuses non-via or stale UUIDs, and reports the postimage only after readback confirms the new position under the same UUID. |
+| `query_vias` | List vias on the board, optionally filtered by net. Each result includes the via's UUID, net, position, drill diameter, pad diameter, and via type. |
+| `check_route_collision` | Pre-flight collision check for a proposed straight trace segment, run before `route_trace`/`route_pad_to_pad` actually create copper (neither does its own clearance checking). Checks the requested board's same-layer tracks and all vias via KiCad IPC with 2D distance geometry, resolves required clearance from the board's effective netclass rules (falling back to KiCad's stock 0.2 mm Default), and returns `clear: true` or a structured conflict list naming the offending item, its net, and the required vs. found clearance. Not a full DRC pass: pad shapes, zones, and non-straight geometry are out of scope. |
+| `classify_nets` | Heuristically classify every net as `power`, `ground`, `differential_pair`, or `signal`. Read-only and derived, not a stored data model. `power`/`ground` match the configured `net_prefix_power`/`net_prefix_ground` naming conventions (from `get_effective_config`, overridable per call) plus common ground spellings; `differential_pair` detects nets paired by a recognized complementary suffix (`_P`/`_N`, `_DP`/`_DM`, `_DP`/`_DN`, `_PLUS`/`_MINUS`, trailing `+`/`-`) where both halves exist on the board. Returns each net's class and the detected positive/negative pairs. |
 
 ### `placement` · 5 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.

@@ -404,10 +404,15 @@ async fn handle_save_project_config(
     ))
 }
 
-async fn handle_get_effective_config(
+/// The merged effective config (user defaults + project overrides).
+///
+/// Factored out of `handle_get_effective_config` so other toolsets can read a
+/// naming convention (e.g. `net_prefix_power`) without re-implementing the
+/// merge or duplicating the default shapes.
+pub(crate) async fn effective_config_value(
     args: &serde_json::Value,
     ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
+) -> serde_json::Value {
     let user_config = read_config(&user_config_path(), default_user_config()).await;
 
     let project_config = if let Ok(project_dir) = resolve_project_dir(args, ctx) {
@@ -417,7 +422,14 @@ async fn handle_get_effective_config(
         default_project_config()
     };
 
-    let effective = deep_merge(&user_config, &project_config);
+    deep_merge(&user_config, &project_config)
+}
+
+async fn handle_get_effective_config(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let effective = effective_config_value(args, ctx).await;
 
     Ok(CallToolResult::text(
         serde_json::to_string(&json!({

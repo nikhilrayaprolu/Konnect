@@ -413,6 +413,24 @@ pub struct IpcTrack {
     pub end: IpcVector2,
 }
 
+/// A via read back from KiCad: through, blind/buried, or micro.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcVia {
+    /// KIID of the via, needed to delete or move it via delete_via/move_via.
+    /// Empty only if KiCAD returned a via without an id.
+    pub uuid: String,
+    pub net_name: String,
+    pub position: IpcVector2,
+    /// Drill hole diameter in mm.
+    pub drill: f64,
+    /// Copper pad diameter in mm, read from the padstack's first copper layer
+    /// (a through via's single PST_NORMAL entry; see `builders::build_via`).
+    pub pad_diameter: f64,
+    /// "through", "blind_buried", "micro", "blind", "buried", or "unknown",
+    /// mirroring `kiapi::board::types::ViaType`.
+    pub via_type: String,
+}
+
 /// A graphic item inside a placed footprint — silkscreen, fabrication, or
 /// courtyard artwork, not a pad.
 ///

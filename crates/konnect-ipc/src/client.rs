@@ -30,6 +30,52 @@ fn layer_enum_to_name(layer: i32) -> &'static str {
         .unwrap_or("Unknown")
 }
 
+/// Map a `Via.type` enum integer to the string `IpcVia::via_type` reports.
+fn via_type_name(via_type: i32) -> &'static str {
+    use kiapi::board::types::ViaType;
+    match ViaType::try_from(via_type).unwrap_or(ViaType::VtUnknown) {
+        ViaType::VtUnknown => "unknown",
+        ViaType::VtThrough => "through",
+        ViaType::VtBlindBuried => "blind_buried",
+        ViaType::VtMicro => "micro",
+        ViaType::VtBlind => "blind",
+        ViaType::VtBuried => "buried",
+    }
+}
+
+/// Decode a raw `Via` protobuf into the [`IpcVia`] read model.
+fn decode_via(via: &kiapi::board::types::Via) -> IpcVia {
+    let uuid = via
+        .id
+        .as_ref()
+        .map(|id| id.value.clone())
+        .unwrap_or_default();
+    let net_name = via.net.as_ref().map(|n| n.name.clone()).unwrap_or_default();
+    let position = via.position.unwrap_or_default();
+    let pad_stack = via.pad_stack.as_ref();
+    let drill = pad_stack
+        .and_then(|stack| stack.drill.as_ref())
+        .and_then(|drill| drill.diameter.as_ref())
+        .map(|d| nm_to_mm(d.x_nm))
+        .unwrap_or(0.0);
+    let pad_diameter = pad_stack
+        .and_then(|stack| stack.copper_layers.first())
+        .and_then(|layer| layer.size.as_ref())
+        .map(|s| nm_to_mm(s.x_nm))
+        .unwrap_or(0.0);
+    IpcVia {
+        uuid,
+        net_name,
+        position: IpcVector2 {
+            x: nm_to_mm(position.x_nm),
+            y: nm_to_mm(position.y_nm),
+        },
+        drill,
+        pad_diameter,
+        via_type: via_type_name(via.r#type).to_string(),
+    }
+}
+
 /// A placed footprint's anchor in board nanometres, and its orientation in
 /// degrees.
 ///
@@ -1228,6 +1274,12 @@ impl KiCadIpcClient {
         }
     }
 
+    /// As [`Self::get_effective_routing_rules_in`], targeting the one bound
+    /// open document.
+    pub fn get_effective_routing_rules(&self) -> Result<IpcEffectiveRoutingRules> {
+        self.get_effective_routing_rules_in(self.get_board_document()?)
+    }
+
     /// Return the effective merged routing rules for every connected net in
     /// one open board.
     ///
@@ -2190,6 +2242,146 @@ impl KiCadIpcClient {
             }
         }
         Ok(tracks)
+    }
+
+    /// Query vias, optionally filtered by net.
+    pub fn get_vias(&self, net_filter: Option<&str>) -> Result<Vec<IpcVia>> {
+        self.get_vias_in(self.get_board_document()?, net_filter)
+    }
+
+    /// As [`Self::get_vias`], targeting one exact open document.
+    pub fn get_vias_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_filter: Option<&str>,
+    ) -> Result<Vec<IpcVia>> {
+        let items =
+            self.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbTrace)?;
+        let mut vias = Vec::new();
+        for item in &items {
+            // KOT_PCB_TRACE is a family selector that also returns straight
+            // Track segments and Arcs, and protobuf decoding is permissive
+            // enough to accept compatible bytes under the wrong declared
+            // type. Type-check before decode (see get_tracks_in).
+            if !crate::builders::any_is(item, "kiapi.board.types.Via") {
+                continue;
+            }
+            let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) else {
+                continue;
+            };
+            let decoded = decode_via(&via);
+            if let Some(nf) = net_filter {
+                if decoded.net_name != nf {
+                    continue;
+                }
+            }
+            vias.push(decoded);
+        }
+        Ok(vias)
+    }
+
+    /// Delete one observed via from the requested board.
+    ///
+    /// Mirrors [`Self::delete_trace_segment_verified`]: `DeleteItems` accepts
+    /// any board-item KIID, so the item must first be proven to belong to the
+    /// requested board's via set (KOT_PCB_TRACE is a family selector shared
+    /// with tracks — a trace segment's UUID must not silently succeed here).
+    /// A second via query then proves the observed via is gone before this
+    /// reports success.
+    pub fn delete_via_verified(&self, requested: &Path, uuid: &str) -> Result<Option<IpcVia>> {
+        let document = self.find_open_board(requested)?;
+        let before = self.get_vias_in(document.clone(), None)?;
+        let Some(via) = before.into_iter().find(|via| via.uuid == uuid) else {
+            return Ok(None);
+        };
+
+        self.delete_items_in(document.clone(), vec![uuid.to_string()])?;
+        let remains = self
+            .get_vias_in(document, None)
+            .with_context(|| {
+                format!(
+                    "KiCad accepted deletion of via '{}' but post-delete read-back failed; the deletion may have committed",
+                    uuid
+                )
+            })?
+            .into_iter()
+            .any(|candidate| candidate.uuid == uuid);
+        if remains {
+            anyhow::bail!(
+                "KiCad accepted deletion of via '{}' but read-back still reports it",
+                uuid
+            );
+        }
+        Ok(Some(via))
+    }
+
+    /// Move one observed via to a new position on the requested board.
+    ///
+    /// Finds the via by UUID among the board's KOT_PCB_TRACE items (proving
+    /// it is actually a via, not a trace segment sharing the same family
+    /// selector), mutates its position in place, and commits through
+    /// `UpdateItems` — the same get→decode→mutate→pack→update pattern
+    /// `move_footprint` uses. Unlike `move_footprint`, this verifies the
+    /// postcondition: a re-query must still report the via under the same
+    /// UUID, at the requested position, before this reports success. If
+    /// KiCad reissues a new UUID on update (observed for some item kinds),
+    /// this fails closed rather than guessing which via is the moved one —
+    /// call `query_vias`/`get_vias` to find it.
+    pub fn move_via_verified(
+        &self,
+        requested: &Path,
+        uuid: &str,
+        new_x: f64,
+        new_y: f64,
+    ) -> Result<Option<IpcVia>> {
+        let document = self.find_open_board(requested)?;
+        let items = self.get_items_in(
+            document.clone(),
+            kiapi::common::types::KiCadObjectType::KotPcbTrace,
+        )?;
+        let mut target: Option<kiapi::board::types::Via> = None;
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.Via") {
+                continue;
+            }
+            let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) else {
+                continue;
+            };
+            if via.id.as_ref().map(|id| id.value.as_str()) == Some(uuid) {
+                target = Some(via);
+                break;
+            }
+        }
+        let Some(mut via) = target else {
+            return Ok(None);
+        };
+
+        via.position = Some(crate::builders::vec2(new_x, new_y));
+        let any = crate::builders::pack_any(&via, "kiapi.board.types.Via");
+        self.update_items_in(document.clone(), vec![any])?;
+
+        let after = self.get_vias_in(document, None).with_context(|| {
+            format!(
+                "KiCad accepted move of via '{}' but post-move read-back failed; the move may have committed",
+                uuid
+            )
+        })?;
+        let moved = after.into_iter().find(|v| v.uuid == uuid).ok_or_else(|| {
+            anyhow::anyhow!(
+                "KiCad accepted move of via '{uuid}' but read-back no longer reports that \
+                 UUID — KiCad may have reissued a new UUID on update. Call query_vias to \
+                 find the via at its new position before retrying."
+            )
+        })?;
+        if (moved.position.x - new_x).abs() > 1e-6 || (moved.position.y - new_y).abs() > 1e-6 {
+            anyhow::bail!(
+                "KiCad accepted move of via '{uuid}' but read-back position is ({}, {}), not \
+                 the requested ({new_x}, {new_y})",
+                moved.position.x,
+                moved.position.y
+            );
+        }
+        Ok(Some(moved))
     }
 
     /// Move a footprint to a new position.
