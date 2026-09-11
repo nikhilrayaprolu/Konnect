@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **21 toolsets** organized into 10 categories
-- **231 registered tools** + **7 always-visible meta-tools** = **238 total**
+- **23 toolsets** organized into 11 categories
+- **238 registered tools** + **7 always-visible meta-tools** = **245 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -28,7 +28,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 23 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -479,6 +479,33 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB output applies versioned footprint/component CPL corrections, reports every match and unmatched footprint, and requires a Component Placements preview. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
+
+---
+
+## Design Intent
+
+### `design_intent` · 5 tools
+**Purpose:** Persisted engineering intent (functional blocks, interfaces, net priorities, decision log) at `<project_dir>/.konnect/design_intent.json`, plus a non-mutating heuristic analysis draft.
+**Source:** [`crates/konnect-core/src/tools/design_intent.rs`](crates/konnect-core/src/tools/design_intent.rs)
+
+| Tool | Description |
+|------|-------------|
+| `get_design_intent` | Read the project's persisted design-intent model. Returns an empty default skeleton — not an error — when no file exists yet. |
+| `set_design_intent` | Replace the entire design-intent document after validating its shape (priority enums, interface kinds, array/object types). Prefer `update_design_intent` for partial changes. |
+| `update_design_intent` | Merge a partial patch's `functional_blocks` / `interfaces` / `net_priorities` into the existing document by id, without touching anything else. `decisions` is not accepted here. |
+| `record_decision` | Append a timestamped engineering decision (decision, reason, scope) to the append-only decision log. |
+| `analyze_design` | Non-mutating. Propose a draft `functional_blocks` breakdown: one block per hierarchical sheet (from `get_sheet_hierarchy` + `list_schematic_components`), or a PCB net-cluster / single-block fallback for a flat schematic. Also seeds `net_priorities` defaults for power/ground nets and matched differential pairs. Never writes `design_intent.json` itself. |
+
+---
+
+### `phase_gate` · 2 tools
+**Purpose:** Phase-gated workflow state (analysis → floorplan → placement → critical_routing → routing → planes → verification) at `<project_dir>/.konnect/phase_state.json`. `route_trace`, `route_pad_to_pad`, `add_via`, and `route_differential_pair` (in `pcb_routing`) refuse to run below `critical_routing`.
+**Source:** [`crates/konnect-core/src/tools/phase_gate.rs`](crates/konnect-core/src/tools/phase_gate.rs)
+
+| Tool | Description |
+|------|-------------|
+| `get_phase_state` | Read the project's persisted workflow phase, phase history, and any recorded force overrides. Defaults to phase 'analysis' when no file exists yet. |
+| `advance_phase` | Move to a new phase. A forward move checks that phase's own gate criteria (placement needs a functional block; critical_routing/routing need `score_placement` to not hard-fail; verification needs `run_drc`'s `unconnected_items` at zero) and refuses naming exactly what's unmet. A backward move never gates. `force: true` skips criteria but requires a non-empty `reason`, recorded in `phase_state.json`'s `overrides`. |
 
 ---
 

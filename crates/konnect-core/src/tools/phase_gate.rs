@@ -202,7 +202,8 @@ async fn unmet_criteria_for(target: Phase, board: &Path, ctx: &ToolContext) -> V
             let args = json!({ "board": board.to_string_lossy() });
             match super::placement::handle_score_placement(&args, ctx).await {
                 Ok(result) if !result.is_error => {
-                    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0]
+                    else {
                         return vec!["score_placement returned non-text content".to_string()];
                     };
                     let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
@@ -221,13 +222,10 @@ async fn unmet_criteria_for(target: Phase, board: &Path, ctx: &ToolContext) -> V
                 Ok(result) => {
                     vec![format!(
                         "score_placement could not be evaluated: {}",
-                        result.content.first().map_or(
-                            String::new(),
-                            |c| match c {
-                                crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
-                                _ => String::new(),
-                            }
-                        )
+                        result.content.first().map_or(String::new(), |c| match c {
+                            crate::mcp::protocol::ToolContent::Text { text } => text.clone(),
+                            _ => String::new(),
+                        })
                     )]
                 }
                 Err(error) => vec![format!("score_placement failed to run: {error}")],
@@ -246,10 +244,12 @@ async fn unmet_criteria_for(target: Phase, board: &Path, ctx: &ToolContext) -> V
             // contradict. A `null` (category not reported by this kicad-cli)
             // is treated the same as a nonzero count — fail closed, since
             // "never asked" and "zero found" must not look the same here.
-            let args = json!({ "board": board.to_string_lossy(), "severity": "warning", "limit": 1 });
+            let args =
+                json!({ "board": board.to_string_lossy(), "severity": "warning", "limit": 1 });
             match super::verification::handle_run_drc(&args, ctx).await {
                 Ok(result) if !result.is_error => {
-                    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+                    let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0]
+                    else {
                         return vec!["run_drc returned non-text content".to_string()];
                     };
                     let body: Value = serde_json::from_str(text).unwrap_or(Value::Null);
@@ -286,7 +286,10 @@ async fn unmet_criteria_for(target: Phase, board: &Path, ctx: &ToolContext) -> V
 /// state is small, changes rarely mid-session, and a stale in-memory phase
 /// letting a routing call through after the project was deliberately walked
 /// back a phase is a worse failure mode than one extra file read per call.
-pub(crate) async fn require_phase_at_least(board: &Path, min_phase: Phase) -> Result<(), CallToolResult> {
+pub(crate) async fn require_phase_at_least(
+    board: &Path,
+    min_phase: Phase,
+) -> Result<(), CallToolResult> {
     let project_dir = project_dir_from_board(board);
     let path = phase_state_path(&project_dir);
     let state = read_state(&path).await;
@@ -369,7 +372,10 @@ pub fn tools() -> Vec<ToolDef> {
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
-async fn handle_get_phase_state(args: &Value, _ctx: &ToolContext) -> anyhow::Result<CallToolResult> {
+async fn handle_get_phase_state(
+    args: &Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
     let board = get_path(args, "board")?;
     let project_dir = project_dir_from_board(&board);
     let path = phase_state_path(&project_dir);
@@ -393,13 +399,18 @@ async fn handle_advance_phase(args: &Value, ctx: &ToolContext) -> anyhow::Result
         return Ok(CallToolResult::error_kind(
             ToolErrorKind::InvalidArgument {
                 field: "target_phase".to_string(),
-                reason: format!("must be one of {:?}, got '{target_name}'", Phase::all_names()),
+                reason: format!(
+                    "must be one of {:?}, got '{target_name}'",
+                    Phase::all_names()
+                ),
             },
             format!("Unknown phase '{target_name}'"),
         ));
     };
     let force = args["force"].as_bool().unwrap_or(false);
-    let reason = opt_str(args, "reason").map(str::trim).filter(|r| !r.is_empty());
+    let reason = opt_str(args, "reason")
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
 
     if force && reason.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -461,12 +472,15 @@ async fn handle_advance_phase(args: &Value, ctx: &ToolContext) -> anyhow::Result
                 last["exited_at"] = json!(now);
             }
         }
-        history.push(json!({ "phase": target.as_str(), "entered_at": now, "exited_at": Value::Null }));
+        history
+            .push(json!({ "phase": target.as_str(), "entered_at": now, "exited_at": Value::Null }));
     }
 
     if is_forward {
         let completed = ensure_array_field(obj, "completed_phases");
-        let already = completed.iter().any(|v| v.as_str() == Some(current.as_str()));
+        let already = completed
+            .iter()
+            .any(|v| v.as_str() == Some(current.as_str()));
         if !already {
             completed.push(json!(current.as_str()));
         }
@@ -531,7 +545,9 @@ mod tests {
     async fn seed_functional_block(board: &Path) {
         let project_dir = project_dir_from_board(board);
         let path = project_dir.join(".konnect").join("design_intent.json");
-        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
         let doc = json!({
             "version": 1,
             "functional_blocks": { "power": { "label": "Power", "components": ["U1"] } },
@@ -600,7 +616,9 @@ mod tests {
         assert_eq!(body["error"]["required_phase"], "critical_routing");
         let unmet = body["error"]["unmet_criteria"].as_array().unwrap();
         assert!(
-            unmet.iter().any(|c| c.as_str().unwrap().contains("hard_fail")),
+            unmet
+                .iter()
+                .any(|c| c.as_str().unwrap().contains("hard_fail")),
             "{unmet:?}"
         );
 
@@ -608,7 +626,10 @@ mod tests {
         let state = handle_get_phase_state(&json!({ "board": board.to_string_lossy() }), &ctx)
             .await
             .unwrap();
-        assert_eq!(result_json(&state)["phase_state"]["current_phase"], "analysis");
+        assert_eq!(
+            result_json(&state)["phase_state"]["current_phase"],
+            "analysis"
+        );
     }
 
     #[tokio::test]
@@ -702,7 +723,10 @@ mod tests {
         let state = handle_get_phase_state(&json!({ "board": board.to_string_lossy() }), &ctx)
             .await
             .unwrap();
-        assert_eq!(result_json(&state)["phase_state"]["current_phase"], "analysis");
+        assert_eq!(
+            result_json(&state)["phase_state"]["current_phase"],
+            "analysis"
+        );
     }
 
     #[tokio::test]
@@ -764,10 +788,7 @@ mod tests {
         .await
         .unwrap();
         assert!(refused.is_error, "{refused:?}");
-        assert_eq!(
-            result_json(&refused)["error"]["kind"],
-            "phase_gate_blocked"
-        );
+        assert_eq!(result_json(&refused)["error"]["kind"], "phase_gate_blocked");
 
         seed_functional_block(&board).await;
 

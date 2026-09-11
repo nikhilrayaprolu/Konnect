@@ -735,7 +735,11 @@ pub fn iso8601_now() -> String {
     let secs = since_epoch.as_secs() as i64;
     let days = secs.div_euclid(86400);
     let time_of_day = secs.rem_euclid(86400);
-    let (hour, minute, second) = (time_of_day / 3600, (time_of_day % 3600) / 60, time_of_day % 60);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }

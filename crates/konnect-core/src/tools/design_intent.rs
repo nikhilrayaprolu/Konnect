@@ -228,7 +228,10 @@ fn validate_functional_block(id: &str, block: &Value) -> Result<(), CallToolResu
         .ok_or_else(|| invalid_intent(&format!("functional_blocks.{id}"), "must be an object"))?;
     if let Some(priority) = obj.get("priority") {
         let priority = priority.as_str().ok_or_else(|| {
-            invalid_intent(&format!("functional_blocks.{id}.priority"), "must be a string")
+            invalid_intent(
+                &format!("functional_blocks.{id}.priority"),
+                "must be a string",
+            )
         })?;
         if !PRIORITIES.contains(&priority) {
             return Err(invalid_intent(
@@ -239,7 +242,10 @@ fn validate_functional_block(id: &str, block: &Value) -> Result<(), CallToolResu
     }
     if let Some(components) = obj.get("components") {
         let components = components.as_array().ok_or_else(|| {
-            invalid_intent(&format!("functional_blocks.{id}.components"), "must be an array")
+            invalid_intent(
+                &format!("functional_blocks.{id}.components"),
+                "must be an array",
+            )
         })?;
         if !components.iter().all(Value::is_string) {
             return Err(invalid_intent(
@@ -279,7 +285,10 @@ fn validate_interface(id: &str, iface: &Value) -> Result<(), CallToolResult> {
     for array_field in ["blocks", "constraints"] {
         if let Some(v) = obj.get(array_field) {
             let arr = v.as_array().ok_or_else(|| {
-                invalid_intent(&format!("interfaces.{id}.{array_field}"), "must be an array")
+                invalid_intent(
+                    &format!("interfaces.{id}.{array_field}"),
+                    "must be an array",
+                )
             })?;
             if !arr.iter().all(Value::is_string) {
                 return Err(invalid_intent(
@@ -294,7 +303,10 @@ fn validate_interface(id: &str, iface: &Value) -> Result<(), CallToolResult> {
 
 fn validate_net_priority(net: &str, priority: &Value) -> Result<(), CallToolResult> {
     let priority = priority.as_str().ok_or_else(|| {
-        invalid_intent(&format!("net_priorities.{net}"), "priority must be a string")
+        invalid_intent(
+            &format!("net_priorities.{net}"),
+            "priority must be a string",
+        )
     })?;
     if !PRIORITIES.contains(&priority) {
         return Err(invalid_intent(
@@ -324,25 +336,25 @@ fn validate_intent_shape(intent: &Value) -> Result<(), CallToolResult> {
         .ok_or_else(|| invalid_intent("intent", "must be a JSON object"))?;
 
     if let Some(blocks) = obj.get("functional_blocks") {
-        let blocks = blocks
-            .as_object()
-            .ok_or_else(|| invalid_intent("functional_blocks", "must be an object keyed by block_id"))?;
+        let blocks = blocks.as_object().ok_or_else(|| {
+            invalid_intent("functional_blocks", "must be an object keyed by block_id")
+        })?;
         for (id, block) in blocks {
             validate_functional_block(id, block)?;
         }
     }
     if let Some(interfaces) = obj.get("interfaces") {
-        let interfaces = interfaces
-            .as_object()
-            .ok_or_else(|| invalid_intent("interfaces", "must be an object keyed by interface_id"))?;
+        let interfaces = interfaces.as_object().ok_or_else(|| {
+            invalid_intent("interfaces", "must be an object keyed by interface_id")
+        })?;
         for (id, iface) in interfaces {
             validate_interface(id, iface)?;
         }
     }
     if let Some(priorities) = obj.get("net_priorities") {
-        let priorities = priorities
-            .as_object()
-            .ok_or_else(|| invalid_intent("net_priorities", "must be an object keyed by net name"))?;
+        let priorities = priorities.as_object().ok_or_else(|| {
+            invalid_intent("net_priorities", "must be an object keyed by net name")
+        })?;
         for (net, priority) in priorities {
             validate_net_priority(net, priority)?;
         }
@@ -362,7 +374,10 @@ fn validate_intent_shape(intent: &Value) -> Result<(), CallToolResult> {
 /// with `{}`), then return a mutable handle to it. Never panics: a corrupted
 /// on-disk document with e.g. `"functional_blocks": null` self-heals to `{}`
 /// on the next update rather than crashing the handler.
-fn ensure_object_field<'a>(obj: &'a mut Map<String, Value>, field: &str) -> &'a mut Map<String, Value> {
+fn ensure_object_field<'a>(
+    obj: &'a mut Map<String, Value>,
+    field: &str,
+) -> &'a mut Map<String, Value> {
     if !obj.get(field).is_some_and(Value::is_object) {
         obj.insert(field.to_string(), json!({}));
     }
@@ -469,7 +484,10 @@ async fn handle_update_design_intent(
     // Validate every incoming entry BEFORE touching the on-disk document —
     // a half-applied patch (block A merged, block B rejected) would leave the
     // file in a state neither the caller nor a prior reader asked for.
-    if let Some(blocks) = patch_obj.get("functional_blocks").and_then(Value::as_object) {
+    if let Some(blocks) = patch_obj
+        .get("functional_blocks")
+        .and_then(Value::as_object)
+    {
         for (id, block) in blocks {
             if let Err(error) = validate_functional_block(id, block) {
                 return Ok(error);
@@ -529,7 +547,11 @@ async fn handle_record_decision(
     let reason = opt_str(args, "reason").unwrap_or("").to_string();
     let scope: Vec<String> = match &args["scope"] {
         Value::Null => Vec::new(),
-        Value::Array(items) => match items.iter().map(|v| v.as_str().map(str::to_string)).collect() {
+        Value::Array(items) => match items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect()
+        {
             Some(strings) => strings,
             None => return Ok(invalid_intent("scope", "every entry must be a string")),
         },
@@ -586,7 +608,8 @@ async fn handle_analyze_design(args: &Value, ctx: &ToolContext) -> anyhow::Resul
 
     let project_name = crate::tools::project_name_for(&schematic);
     let mut visited = HashSet::new();
-    let tree = super::sch_hierarchy::build_hierarchy_node(&schematic, &project_name, 0, &mut visited)?;
+    let tree =
+        super::sch_hierarchy::build_hierarchy_node(&schematic, &project_name, 0, &mut visited)?;
 
     let root_dir = schematic
         .parent()
@@ -617,8 +640,9 @@ async fn handle_analyze_design(args: &Value, ctx: &ToolContext) -> anyhow::Resul
         let root_components = components_in_schematic(root_file, ctx).await?;
 
         if let Some(board_path) = board.as_deref().filter(|b| b.exists()) {
-            for (cluster_index, members) in
-                cluster_by_shared_nets(board_path, &root_components)?.into_iter().enumerate()
+            for (cluster_index, members) in cluster_by_shared_nets(board_path, &root_components)?
+                .into_iter()
+                .enumerate()
             {
                 blocks.push(BlockDraft {
                     id: format!("cluster_{}", cluster_index + 1),
@@ -647,7 +671,8 @@ async fn handle_analyze_design(args: &Value, ctx: &ToolContext) -> anyhow::Resul
         }
     };
     let naming = effective_naming_conventions(
-        board.as_deref()
+        board
+            .as_deref()
             .map(project_dir_from_board)
             .or_else(|| schematic.parent().map(Path::to_path_buf)),
         ctx,
@@ -673,12 +698,13 @@ async fn handle_analyze_design(args: &Value, ctx: &ToolContext) -> anyhow::Resul
                     "Heuristic draft derived from hierarchical sheet '{file}'. Not authoritative \
                      — review membership and priority before calling update_design_intent."
                 ),
-                None if derivation == "pcb_net_clusters" => format!(
+                None if derivation == "pcb_net_clusters" => {
                     "Heuristic draft: components sharing at least one PCB net, grouped by \
                      union-find (same technique as auto_place_from_schematic). No hierarchical \
                      sheets were found, so this is a connectivity guess, not an engineering \
                      grouping — review before committing."
-                ),
+                        .to_string()
+                }
                 None => format!(
                     "No hierarchical sheets and no 'board' argument, so every component in \
                      '{}' landed in one block — this draft cannot subdivide further. Add \
@@ -787,8 +813,11 @@ fn cluster_by_shared_nets(board: &Path, references: &[String]) -> anyhow::Result
     let mut ordered: Vec<String> = references.to_vec();
     ordered.sort();
     ordered.dedup();
-    let ref_index: BTreeMap<&str, usize> =
-        ordered.iter().enumerate().map(|(i, r)| (r.as_str(), i)).collect();
+    let ref_index: BTreeMap<&str, usize> = ordered
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.as_str(), i))
+        .collect();
 
     let mut parent: Vec<usize> = (0..ordered.len()).collect();
     fn find(parent: &mut [usize], i: usize) -> usize {
@@ -814,9 +843,9 @@ fn cluster_by_shared_nets(board: &Path, references: &[String]) -> anyhow::Result
     }
 
     let mut clusters: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-    for i in 0..ordered.len() {
+    for (i, reference) in ordered.iter().enumerate() {
         let root = find(&mut parent, i);
-        clusters.entry(root).or_default().push(ordered[i].clone());
+        clusters.entry(root).or_default().push(reference.clone());
     }
     Ok(clusters.into_values().collect())
 }
@@ -882,8 +911,8 @@ fn classify_net_priorities(
 
     for net in nets {
         let upper = net.to_ascii_uppercase();
-        let is_ground = !ground_upper.is_empty()
-            && (upper == ground_upper || upper.starts_with(&ground_upper));
+        let is_ground =
+            !ground_upper.is_empty() && (upper == ground_upper || upper.starts_with(&ground_upper));
         let is_power = !power_prefix.is_empty() && net.starts_with(power_prefix);
         if is_ground || is_power {
             out.insert(net.clone(), "high");
@@ -1014,18 +1043,26 @@ mod tests {
         // Design intent lives beside the (not-yet-existing) board, at
         // <project_dir>/.konnect/design_intent.json — same convention as
         // project.json.
-        assert!(tmp.path().join(".konnect").join("design_intent.json").exists());
+        assert!(tmp
+            .path()
+            .join(".konnect")
+            .join("design_intent.json")
+            .exists());
 
-        let get_result = handle_get_design_intent(&json!({ "board": board.to_string_lossy() }), &ctx)
-            .await
-            .unwrap();
+        let get_result =
+            handle_get_design_intent(&json!({ "board": board.to_string_lossy() }), &ctx)
+                .await
+                .unwrap();
         let body = result_json(&get_result);
         assert_eq!(body["exists"], true);
         assert_eq!(
             body["design_intent"]["functional_blocks"]["power"]["label"],
             "Power Supply"
         );
-        assert_eq!(body["design_intent"]["net_priorities"]["VCC_5V0"], "critical");
+        assert_eq!(
+            body["design_intent"]["net_priorities"]["VCC_5V0"],
+            "critical"
+        );
         // Untouched top-level keys still default rather than vanishing.
         assert_eq!(body["design_intent"]["interfaces"], json!({}));
     }
@@ -1156,13 +1193,17 @@ mod tests {
         assert_eq!(second_body["recorded"]["reason"], "");
         assert_eq!(second_body["recorded"]["scope"], json!([]));
 
-        let get_result = handle_get_design_intent(&json!({ "board": board.to_string_lossy() }), &ctx)
-            .await
-            .unwrap();
+        let get_result =
+            handle_get_design_intent(&json!({ "board": board.to_string_lossy() }), &ctx)
+                .await
+                .unwrap();
         let body = result_json(&get_result);
         let decisions = body["design_intent"]["decisions"].as_array().unwrap();
         assert_eq!(decisions.len(), 2);
-        assert_eq!(decisions[0]["decision"], "Route USB D+/D- as 90ohm diff pair");
+        assert_eq!(
+            decisions[0]["decision"],
+            "Route USB D+/D- as 90ohm diff pair"
+        );
         assert_eq!(decisions[0]["scope"], json!(["USB_DP", "USB_DN"]));
     }
 
@@ -1218,7 +1259,9 @@ mod tests {
         // right before its closing paren — works regardless of whether the
         // file has a top-level `sheet_instances` block (a blank schematic
         // from `blank_schematic_template()` doesn't).
-        let insert_at = content.rfind(')').expect("schematic must end with a closing paren");
+        let insert_at = content
+            .rfind(')')
+            .expect("schematic must end with a closing paren");
         let mut updated = String::with_capacity(content.len() + block.len() + 1);
         updated.push_str(&content[..insert_at]);
         updated.push_str(&block);
@@ -1298,18 +1341,19 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(components, BTreeSet::from(["R1".to_string(), "R2".to_string()]));
+        assert_eq!(
+            components,
+            BTreeSet::from(["R1".to_string(), "R2".to_string()])
+        );
     }
 
     #[tokio::test]
     async fn analyze_design_reports_file_not_found_for_a_missing_schematic() {
         let ctx = test_ctx();
-        let result = handle_analyze_design(
-            &json!({ "schematic": "/nonexistent/nope.kicad_sch" }),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let result =
+            handle_analyze_design(&json!({ "schematic": "/nonexistent/nope.kicad_sch" }), &ctx)
+                .await
+                .unwrap();
         assert!(result.is_error);
         let body = result_json(&result);
         assert_eq!(body["error"]["kind"], "file_not_found");
@@ -1320,7 +1364,12 @@ mod tests {
     #[test]
     fn classify_net_priorities_seeds_power_ground_and_diff_pairs_as_high() {
         let nets: BTreeSet<String> = [
-            "VCC_3V3", "GND", "USB_D_P", "USB_D_N", "SPI_CLK", "GND_ANALOG",
+            "VCC_3V3",
+            "GND",
+            "USB_D_P",
+            "USB_D_N",
+            "SPI_CLK",
+            "GND_ANALOG",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -1340,7 +1389,13 @@ mod tests {
     #[test]
     fn sanitize_id_disambiguates_collisions() {
         let mut used = HashSet::new();
-        assert_eq!(unique_sanitized_id("Power Supply", &mut used), "power_supply");
-        assert_eq!(unique_sanitized_id("Power Supply!", &mut used), "power_supply_2");
+        assert_eq!(
+            unique_sanitized_id("Power Supply", &mut used),
+            "power_supply"
+        );
+        assert_eq!(
+            unique_sanitized_id("Power Supply!", &mut used),
+            "power_supply_2"
+        );
     }
 }
