@@ -2409,19 +2409,18 @@ async fn handle_query_zones(
     let net = args["net_name"].as_str().map(String::from);
 
     let net_ipc = net.clone();
-    let zones = match with_board_ipc_classified(ctx, &board_path, move |c| {
-        c.get_zones(net_ipc.as_deref())
-    })
-    .await?
-    {
-        Ok(zones) => zones,
-        Err(error) => {
-            return Ok(CallToolResult::error(format!(
-                "KiCAD must be running with the board loaded (IPC error: {})",
-                error.message()
-            )))
-        }
-    };
+    let zones =
+        match with_board_ipc_classified(ctx, &board_path, move |c| c.get_zones(net_ipc.as_deref()))
+            .await?
+        {
+            Ok(zones) => zones,
+            Err(error) => {
+                return Ok(CallToolResult::error(format!(
+                    "KiCAD must be running with the board loaded (IPC error: {})",
+                    error.message()
+                )))
+            }
+        };
 
     let items: Vec<serde_json::Value> = zones
         .iter()

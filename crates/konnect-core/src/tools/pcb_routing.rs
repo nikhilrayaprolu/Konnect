@@ -369,18 +369,23 @@ pub fn tools() -> Vec<ToolDef> {
              route_trace / route_pad_to_pad actually create copper. route_trace does no \
              collision or clearance checking of its own, so a straight point-to-point trace \
              over an existing board is not proven clear of other copper. This queries the \
-             requested board's existing tracks (same layer) and vias (KiCad's KOT_PCB_TRACE \
+             requested board's existing tracks (same layer), vias (KiCad's KOT_PCB_TRACE \
              family selector does not separate layers for vias, so every via is checked \
              regardless of layer — a safe over-approximation, since Konnect's own add_via only \
-             creates through vias spanning every layer) via KiCAD IPC, runs 2D segment-to-segment \
-             and point-to-segment distance checks against each different-net item, and resolves \
-             the required clearance from the board's effective netclass rules (falling back to \
-             KiCad's stock 0.2 mm Default when neither net's clearance is resolvable). Returns \
-             'clear': true or a structured list of conflicts — the offending item, its net, the \
-             clearance the design rules require, and the clearance the geometry actually leaves \
-             — so the caller can choose a different path instead of guessing why a route was \
-             refused. Same-net items are never conflicts. This is not a full DRC pass: pad \
-             shapes, zones, and non-straight geometry are out of scope.",
+             creates through vias spanning every layer), and every placed footprint's pads on \
+             the requested layer via KiCAD IPC, runs 2D segment-to-segment and point-to-segment \
+             distance checks against each different-net item (a pad is approximated as a circle \
+             of radius max(size_x, size_y)/2 — conservative, not exact, since this is a \
+             refuse-if-unsure check), and resolves the required clearance from the board's \
+             effective netclass rules (falling back to KiCad's stock 0.2 mm Default when neither \
+             net's clearance is resolvable). Returns 'clear': true or a structured list of \
+             conflicts — the offending item (track/via/pad, with the pad's owning reference \
+             designator and number), its net, the clearance the design rules require, and the \
+             clearance the geometry actually leaves — so the caller can choose a different path \
+             instead of guessing why a route was refused. Same-net items and unconnected \
+             (netless) pads are never conflicts. This is not a full DRC pass: zones, rotated \
+             non-circular pad shapes, and non-straight geometry are still out of scope — pad \
+             checking is a circular approximation, not exact rectangle/rounded-rect geometry.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1943,11 +1948,12 @@ async fn handle_check_route_collision(
     let width = args["width"].as_f64().unwrap_or(0.25);
 
     let layer_ipc = layer.clone();
-    let (tracks, vias, rules) = ipc!(ctx, args, |c| {
+    let (tracks, vias, pads, rules) = ipc!(ctx, args, |c| {
         let tracks = c.get_tracks(None, Some(layer_ipc.as_str()))?;
         let vias = c.get_vias(None)?;
+        let pads = c.get_all_pads()?;
         let rules = c.get_effective_routing_rules()?;
-        Ok::<_, anyhow::Error>((tracks, vias, rules))
+        Ok::<_, anyhow::Error>((tracks, vias, pads, rules))
     });
 
     let half_width = width / 2.0;
@@ -1997,9 +2003,49 @@ async fn handle_check_route_collision(
         }
     }
 
+    // Component pads: the gap this tool shipped with. A proposed trace was
+    // only ever checked against existing copper (tracks/vias), never against
+    // the pads sitting on the layer it would cross — on a dense board this
+    // let route_pad_to_pad draw straight through a neighbor's pad every time,
+    // undetected, because this was the only pre-flight check available.
+    // Pads are approximated as a circle of radius max(size_x, size_y)/2,
+    // matching how a via's pad_diameter is already treated as a circle above
+    // — conservative (never smaller than the real footprint) rather than
+    // exact, which is the right tradeoff for a pre-flight refuse-if-unsure
+    // check.
+    for board_pad in &pads {
+        let pad = &board_pad.pad;
+        if pad.net == net_name {
+            continue;
+        }
+        if pad.net.is_empty() {
+            continue;
+        }
+        if !pad.layers.iter().any(|l| l == &layer) {
+            continue;
+        }
+        let radius = pad.size_x.max(pad.size_y) / 2.0;
+        if radius <= 0.0 {
+            continue;
+        }
+        let required = required_clearance_mm(&rules, &net_name, &pad.net);
+        let distance = point_segment_distance_mm((pad.x, pad.y), a1, a2);
+        let found = distance - half_width - radius;
+        if found < required {
+            conflicts.push(json!({
+                "kind": "pad",
+                "reference": board_pad.reference,
+                "pad_number": pad.number,
+                "net": pad.net,
+                "clearance_required_mm": required,
+                "clearance_found_mm": found
+            }));
+        }
+    }
+
     Ok(CallToolResult::json(&json!({
         "clear": conflicts.is_empty(),
-        "checked": { "tracks": tracks.len(), "vias": vias.len() },
+        "checked": { "tracks": tracks.len(), "vias": vias.len(), "pads": pads.len() },
         "conflicts": conflicts
     })))
 }

@@ -51,9 +51,11 @@ fn decode_zone(zone: &kiapi::board::types::Zone) -> IpcZone {
         .map(|id| id.value.clone())
         .unwrap_or_default();
     let net_name = match &zone.settings {
-        Some(kiapi::board::types::zone::Settings::CopperSettings(copper)) => {
-            copper.net.as_ref().map(|n| n.name.clone()).unwrap_or_default()
-        }
+        Some(kiapi::board::types::zone::Settings::CopperSettings(copper)) => copper
+            .net
+            .as_ref()
+            .map(|n| n.name.clone())
+            .unwrap_or_default(),
         _ => String::new(),
     };
     let layers = zone
@@ -1921,17 +1923,104 @@ impl KiCadIpcClient {
                             .collect()
                     })
                     .unwrap_or_default();
+                let (size_x, size_y) = pad
+                    .pad_stack
+                    .as_ref()
+                    .and_then(|stack| stack.copper_layers.first())
+                    .and_then(|layer| layer.size.as_ref())
+                    .map(|s| (nm_to_mm(s.x_nm), nm_to_mm(s.y_nm)))
+                    .unwrap_or((0.0, 0.0));
                 pads.push(IpcPad {
                     number: pad.number,
                     x: nm_to_mm(position.x_nm),
                     y: nm_to_mm(position.y_nm),
                     net: pad.net.map(|net| net.name).unwrap_or_default(),
                     layers,
+                    size_x,
+                    size_y,
                 });
             }
             found = Some(pads);
         }
         Ok(found)
+    }
+
+    /// All pads of every footprint placed on the board, in one IPC call —
+    /// the same `GetItems(KOT_PCB_FOOTPRINT)` request `get_footprint_pads_in`
+    /// makes, just not filtered down to a single reference. Used by
+    /// collision-checking, which needs to know about every pad on the board,
+    /// not one footprint's — querying per-footprint in a loop would cost one
+    /// round trip per component instead of one for the whole board.
+    pub fn get_all_pads_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcBoardPad>> {
+        let items = self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
+        let mut all_pads = Vec::new();
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
+                continue;
+            }
+            let Ok(fp) = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+            else {
+                continue;
+            };
+            let reference = footprint_reference(&fp).to_string();
+            let Some(definition) = fp.definition.as_ref() else {
+                continue;
+            };
+            for child in &definition.items {
+                if !crate::builders::any_is(child, "kiapi.board.types.Pad") {
+                    continue;
+                }
+                let Ok(pad) = kiapi::board::types::Pad::decode(child.value.as_slice()) else {
+                    continue;
+                };
+                let Some(position) = pad.position else {
+                    continue;
+                };
+                let layers = pad
+                    .pad_stack
+                    .as_ref()
+                    .map(|stack| {
+                        stack
+                            .layers
+                            .iter()
+                            .map(|layer| layer_enum_to_name(*layer).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let (size_x, size_y) = pad
+                    .pad_stack
+                    .as_ref()
+                    .and_then(|stack| stack.copper_layers.first())
+                    .and_then(|layer| layer.size.as_ref())
+                    .map(|s| (nm_to_mm(s.x_nm), nm_to_mm(s.y_nm)))
+                    .unwrap_or((0.0, 0.0));
+                all_pads.push(IpcBoardPad {
+                    reference: reference.clone(),
+                    pad: IpcPad {
+                        number: pad.number,
+                        x: nm_to_mm(position.x_nm),
+                        y: nm_to_mm(position.y_nm),
+                        net: pad.net.map(|net| net.name).unwrap_or_default(),
+                        layers,
+                        size_x,
+                        size_y,
+                    },
+                });
+            }
+        }
+        Ok(all_pads)
+    }
+
+    /// As [`Self::get_all_pads_in`], targeting the board's currently open
+    /// document.
+    pub fn get_all_pads(&self) -> Result<Vec<IpcBoardPad>> {
+        self.get_all_pads_in(self.get_board_document()?)
     }
 
     /// Read the board's graphics — shapes, text, textboxes, and dimensions —
