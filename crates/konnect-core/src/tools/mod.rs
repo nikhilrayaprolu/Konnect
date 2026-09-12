@@ -4,6 +4,7 @@ mod board_session;
 pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;
+pub mod design_intent;
 pub mod design_review;
 pub mod editor_navigation;
 mod footprint_graphics;
@@ -19,6 +20,7 @@ pub mod pcb_export;
 pub(crate) mod pcb_footprint_update;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
+pub mod phase_gate;
 pub mod placement;
 pub mod project;
 pub mod sch_analysis;
@@ -247,6 +249,38 @@ pub struct ServerConfig {
 /// concurrently see each other's directories.
 #[cfg(test)]
 pub(crate) static KICAD_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod civil_date_tests {
+    use super::civil_from_days;
+
+    #[test]
+    fn epoch_day_zero_is_1970_01_01() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn handles_the_2024_leap_day() {
+        // Days from 1970-01-01 to 2024-02-29 (verified against `date -d`).
+        assert_eq!(civil_from_days(19782), (2024, 2, 29));
+    }
+
+    #[test]
+    fn handles_a_march_1st_century_boundary() {
+        // 2000-03-01 — exercises the era/century-leap-year branch.
+        assert_eq!(civil_from_days(11017), (2000, 3, 1));
+    }
+
+    #[test]
+    fn iso8601_now_has_the_expected_shape() {
+        let ts = super::iso8601_now();
+        assert_eq!(ts.len(), 20, "{ts}");
+        assert!(ts.ends_with('Z'), "{ts}");
+        assert_eq!(ts.as_bytes()[4], b'-');
+        assert_eq!(ts.as_bytes()[7], b'-');
+        assert_eq!(ts.as_bytes()[10], b'T');
+    }
+}
 
 #[cfg(test)]
 mod query_cache_tests {
@@ -685,6 +719,45 @@ pub fn project_name_for(sch_path: &std::path::Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// Current UTC time as an ISO 8601 / RFC 3339 string (`2026-09-10T12:34:56Z`),
+/// with no calendar-library dependency. Shared by `design_intent` (decision
+/// log timestamps) and `phase_gate` (phase-history / override timestamps).
+///
+/// Civil-date conversion uses Howard Hinnant's `civil_from_days` algorithm
+/// (public domain, chrono-independent) — see the unit tests below for
+/// spot-checks against known dates, including the 2024-02-29 leap day.
+pub fn iso8601_now() -> String {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = since_epoch.as_secs() as i64;
+    let days = secs.div_euclid(86400);
+    let time_of_day = secs.rem_euclid(86400);
+    let (hour, minute, second) = (
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60,
+    );
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Days-since-Unix-epoch → (year, month, day). Standard algorithm; see
+/// http://howardhinnant.github.io/date_algorithms.html#civil_from_days.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Minimal valid blank schematic, with a freshly generated root `(uuid ...)`.

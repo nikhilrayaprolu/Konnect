@@ -273,6 +273,22 @@ pub struct IpcPad {
     pub net: String,
     /// KiCad layer names from the live pad stack.
     pub layers: Vec<String>,
+    /// Pad copper size in mm, read from the pad stack's first copper layer
+    /// (mirrors how `IpcVia::pad_diameter` reads a via's copper size). 0.0
+    /// when the pad stack has no copper layer entry to read.
+    pub size_x: f64,
+    pub size_y: f64,
+}
+
+/// One pad of one placed footprint, as returned by a whole-board pad query
+/// (`get_all_pads`) rather than a single-footprint lookup — carries the
+/// owning footprint's reference designator alongside the pad itself, since a
+/// whole-board query has no other way to say which footprint a pad belongs
+/// to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcBoardPad {
+    pub reference: String,
+    pub pad: IpcPad,
 }
 
 /// The document's title block, which the board file also carries.
@@ -411,6 +427,41 @@ pub struct IpcTrack {
     pub width: f64,
     pub start: IpcVector2,
     pub end: IpcVector2,
+}
+
+/// A via read back from KiCad: through, blind/buried, or micro.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcVia {
+    /// KIID of the via, needed to delete or move it via delete_via/move_via.
+    /// Empty only if KiCAD returned a via without an id.
+    pub uuid: String,
+    pub net_name: String,
+    pub position: IpcVector2,
+    /// Drill hole diameter in mm.
+    pub drill: f64,
+    /// Copper pad diameter in mm, read from the padstack's first copper layer
+    /// (a through via's single PST_NORMAL entry; see `builders::build_via`).
+    pub pad_diameter: f64,
+    /// "through", "blind_buried", "micro", "blind", "buried", or "unknown",
+    /// mirroring `kiapi::board::types::ViaType`.
+    pub via_type: String,
+}
+
+/// A copper zone read back from KiCad — a filled pour or keepout area.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcZone {
+    /// KIID of the zone, needed to delete it via delete_zone. Empty only if
+    /// KiCAD returned a zone without an id.
+    pub uuid: String,
+    /// User-assigned zone name (e.g. "GND_POUR_FCU"), empty if unnamed.
+    pub name: String,
+    /// Net name for a copper zone, "" for a keepout/rule-area zone which has
+    /// no net.
+    pub net_name: String,
+    /// Board layers this zone spans (e.g. ["F.Cu"], or multiple for a zone
+    /// drawn across several layers at once).
+    pub layers: Vec<String>,
+    pub filled: bool,
 }
 
 /// A graphic item inside a placed footprint — silkscreen, fabrication, or

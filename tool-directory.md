@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **21 toolsets** organized into 10 categories
-- **226 registered tools** + **7 always-visible meta-tools** = **233 total**
+- **23 toolsets** organized into 11 categories
+- **240 registered tools** + **7 always-visible meta-tools** = **247 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -28,7 +28,7 @@ and Windows servers do not.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 23 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -232,7 +232,7 @@ and Windows servers do not.
 
 ## PCB
 
-### `pcb_board` · 12 tools
+### `pcb_board` · 14 tools
 **Purpose:** Board outline, layers, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -249,6 +249,8 @@ and Windows servers do not.
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position, under the MountingHole library name stock KiCad 10 ships for that drill; a drill with no shipped footprint is refused. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
+| `query_zones` | List copper zones on the board via KiCad IPC, optionally filtered by net. Each result includes the zone's UUID (for `delete_zone`), name, layers, and fill status. |
+| `delete_zone` | Delete a copper zone identified by its UUID via KiCad IPC. Refuses UUIDs that are not observed zones on the requested board, then verifies the zone is absent before reporting success. Returns the observed preimage and postcondition. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
 ### `pcb_components` · 19 tools
@@ -277,7 +279,7 @@ and Windows servers do not.
 | `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 15 tools
+### `pcb_routing` · 20 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs, and strict Specctra SES import.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -298,6 +300,11 @@ and Windows servers do not.
 | `get_netclasses` | Read every netclass with its settings, its `netclass_patterns` and the board nets those patterns match. Reads the `.kicad_pro` and the board file, so KiCad need not be running. Reports `Default` (marked) and any pattern naming a class that does not exist. |
 | `assign_net_to_class` | Assign a net to an existing netclass via a `netclass_patterns` entry in the `.kicad_pro`; reassigning moves the entry. |
 | `route_differential_pair` | Route a differential pair (two parallel traces with a specified gap). |
+| `delete_via` | Delete one observed via by UUID via KiCad IPC. Refuses a trace segment's UUID or a stale UUID before deletion (vias and traces share KiCad's KOT_PCB_TRACE family selector), targets the requested board, and reports the observed preimage only after readback proves the via is absent. |
+| `move_via` | Move one observed via to a new position via KiCad IPC. Refuses non-via or stale UUIDs, and reports the postimage only after readback confirms the new position under the same UUID. |
+| `query_vias` | List vias on the board, optionally filtered by net. Each result includes the via's UUID, net, position, drill diameter, pad diameter, and via type. |
+| `check_route_collision` | Pre-flight collision check for a proposed straight trace segment, run before `route_trace`/`route_pad_to_pad` actually create copper (neither does its own clearance checking). Checks the requested board's same-layer tracks and all vias via KiCad IPC with 2D distance geometry, resolves required clearance from the board's effective netclass rules (falling back to KiCad's stock 0.2 mm Default), and returns `clear: true` or a structured conflict list naming the offending item, its net, and the required vs. found clearance. Not a full DRC pass: pad shapes, zones, and non-straight geometry are out of scope. |
+| `classify_nets` | Heuristically classify every net as `power`, `ground`, `differential_pair`, or `signal`. Read-only and derived, not a stored data model. `power`/`ground` match the configured `net_prefix_power`/`net_prefix_ground` naming conventions (from `get_effective_config`, overridable per call) plus common ground spellings; `differential_pair` detects nets paired by a recognized complementary suffix (`_P`/`_N`, `_DP`/`_DM`, `_DP`/`_DN`, `_PLUS`/`_MINUS`, trailing `+`/`-`) where both halves exist on the board. Returns each net's class and the detected positive/negative pairs. |
 
 ### `placement` · 5 tools
 **Purpose:** Placement quality and automation — score, plan decoupling rows, plan BGA fanouts; every plan reports its own before/after score.
@@ -474,6 +481,33 @@ the router or relying on the KiCad ActionPlugin workflow.
 | `export_manufacturing_package` | Generate ALL files needed for PCB fab + assembly in one call: Gerbers, drill, fab-house BOM, and pick-and-place. JLCPCB output applies versioned footprint/component CPL corrections, reports every match and unmatched footprint, and requires a Component Placements preview. |
 | `validate_for_manufacturing` | Board pre-flight before ordering: checks outline, design rules, footprints, routing evidence, and complete DRC results. |
 | `estimate_cost` | Estimate total manufacturing cost from board dimensions, layers, and footprint count, with an itemized breakdown. |
+
+---
+
+## Design Intent
+
+### `design_intent` · 5 tools
+**Purpose:** Persisted engineering intent (functional blocks, interfaces, net priorities, decision log) at `<project_dir>/.konnect/design_intent.json`, plus a non-mutating heuristic analysis draft.
+**Source:** [`crates/konnect-core/src/tools/design_intent.rs`](crates/konnect-core/src/tools/design_intent.rs)
+
+| Tool | Description |
+|------|-------------|
+| `get_design_intent` | Read the project's persisted design-intent model. Returns an empty default skeleton — not an error — when no file exists yet. |
+| `set_design_intent` | Replace the entire design-intent document after validating its shape (priority enums, interface kinds, array/object types). Prefer `update_design_intent` for partial changes. |
+| `update_design_intent` | Merge a partial patch's `functional_blocks` / `interfaces` / `net_priorities` into the existing document by id, without touching anything else. `decisions` is not accepted here. |
+| `record_decision` | Append a timestamped engineering decision (decision, reason, scope) to the append-only decision log. |
+| `analyze_design` | Non-mutating. Propose a draft `functional_blocks` breakdown: one block per hierarchical sheet (from `get_sheet_hierarchy` + `list_schematic_components`), or a PCB net-cluster / single-block fallback for a flat schematic. Also seeds `net_priorities` defaults for power/ground nets and matched differential pairs. Never writes `design_intent.json` itself. |
+
+---
+
+### `phase_gate` · 2 tools
+**Purpose:** Phase-gated workflow state (analysis → floorplan → placement → critical_routing → routing → planes → verification) at `<project_dir>/.konnect/phase_state.json`. `route_trace`, `route_pad_to_pad`, `add_via`, and `route_differential_pair` (in `pcb_routing`) refuse to run below `critical_routing`.
+**Source:** [`crates/konnect-core/src/tools/phase_gate.rs`](crates/konnect-core/src/tools/phase_gate.rs)
+
+| Tool | Description |
+|------|-------------|
+| `get_phase_state` | Read the project's persisted workflow phase, phase history, and any recorded force overrides. Defaults to phase 'analysis' when no file exists yet. |
+| `advance_phase` | Move to a new phase. A forward move checks that phase's own gate criteria (placement needs a functional block; critical_routing/routing need `score_placement` to not hard-fail; verification needs `run_drc`'s `unconnected_items` at zero) and refuses naming exactly what's unmet. A backward move never gates. `force: true` skips criteria but requires a non-empty `reason`, recorded in `phase_state.json`'s `overrides`. |
 
 ---
 

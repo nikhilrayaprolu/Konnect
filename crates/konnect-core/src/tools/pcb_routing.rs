@@ -2,6 +2,15 @@
 //!
 //! Routing operations use the KiCAD IPC API; `add_net`, `create_netclass`, and
 //! `add_copper_pour` use S-expression file manipulation.
+//!
+//! `route_trace`, `route_pad_to_pad`, `add_via`, and `route_differential_pair`
+//! (the actual copper-mutating tools) each call
+//! `phase_gate::require_phase_at_least(board, Phase::CriticalRouting)` before
+//! doing anything else, refusing with a structured `phase_gate_blocked` error
+//! if the project's persisted workflow phase (`.konnect/phase_state.json`)
+//! hasn't reached `critical_routing` yet. This is a deliberately narrow
+//! enforcement surface — see `tools/phase_gate.rs`'s module doc for why only
+//! these four tools are gated and not the other 220+ in this server.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -17,6 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use super::cli;
+use super::phase_gate::{require_phase_at_least, Phase};
 
 macro_rules! ipc {
     ($ctx:expr, $args:expr, |$c:ident| $body:expr) => {{
@@ -301,8 +311,210 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_route_diff_pair(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "delete_via",
+            "Delete a via identified by its UUID via KiCAD IPC. Refuses UUIDs that are not \
+             observed vias on the requested board (including a trace segment's UUID — vias and \
+             traces share KiCad's KOT_PCB_TRACE family selector, so the type is checked before \
+             the delete), then verifies the via is absent before reporting success. Returns the \
+             observed preimage and postcondition.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid":  { "type": "string", "description": "UUID of the via to delete" }
+                },
+                "required": ["board", "uuid"]
+            }),
+            |args, ctx| async move { handle_delete_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "move_via",
+            "Move a via identified by its UUID to a new position via KiCAD IPC. Refuses UUIDs \
+             that are not observed vias on the requested board, then verifies the new position \
+             is reported by a fresh read-back before reporting success. Returns the observed \
+             preimage and postimage.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid":  { "type": "string", "description": "UUID of the via to move" },
+                    "x": { "type": "number", "description": "New X position in mm" },
+                    "y": { "type": "number", "description": "New Y position in mm" }
+                },
+                "required": ["board", "uuid", "x", "y"]
+            }),
+            |args, ctx| async move { handle_move_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "query_vias",
+            "List vias on the board, optionally filtered by net. Each result includes the \
+             via's UUID, which delete_via and move_via take.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string" },
+                    "net_name": { "type": "string", "description": "Filter by net (optional)" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_query_vias(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "check_route_collision",
+            "Pre-flight collision check for a proposed straight trace segment, run before \
+             route_trace / route_pad_to_pad actually create copper. route_trace does no \
+             collision or clearance checking of its own, so a straight point-to-point trace \
+             over an existing board is not proven clear of other copper. This queries the \
+             requested board's existing tracks (same layer), vias (KiCad's KOT_PCB_TRACE \
+             family selector does not separate layers for vias, so every via is checked \
+             regardless of layer — a safe over-approximation, since Konnect's own add_via only \
+             creates through vias spanning every layer), and every placed footprint's pads on \
+             the requested layer via KiCAD IPC, runs 2D segment-to-segment and point-to-segment \
+             distance checks against each different-net item (a pad is approximated as a circle \
+             of radius max(size_x, size_y)/2 — conservative, not exact, since this is a \
+             refuse-if-unsure check), and resolves the required clearance from the board's \
+             effective netclass rules (falling back to KiCad's stock 0.2 mm Default when neither \
+             net's clearance is resolvable). Returns 'clear': true or a structured list of \
+             conflicts — the offending item (track/via/pad, with the pad's owning reference \
+             designator and number), its net, the clearance the design rules require, and the \
+             clearance the geometry actually leaves — so the caller can choose a different path \
+             instead of guessing why a route was refused. Same-net items and unconnected \
+             (netless) pads are never conflicts. This is not a full DRC pass: zones, rotated \
+             non-circular pad shapes, and non-straight geometry are still out of scope — pad \
+             checking is a circular approximation, not exact rectangle/rounded-rect geometry.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string" },
+                    "net_name": { "type": "string", "description": "Net the proposed segment belongs to; same-net items are not conflicts" },
+                    "layer":    { "type": "string", "description": "Copper layer (e.g. 'F.Cu')" },
+                    "x1": { "type": "number" }, "y1": { "type": "number" },
+                    "x2": { "type": "number" }, "y2": { "type": "number" },
+                    "width": { "type": "number", "default": 0.25 }
+                },
+                "required": ["board", "net_name", "layer", "x1", "y1", "x2", "y2"]
+            }),
+            |args, ctx| async move { handle_check_route_collision(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "classify_nets",
+            "Heuristically classify every net on the board as power, ground, differential_pair, \
+             or signal. Read-only and derived — not a stored data model. 'power' matches the \
+             configured net_prefix_power naming convention (from get_effective_config, or the \
+             'net_prefix_power' argument to override it for this call); 'ground' matches \
+             net_prefix_ground plus common ground-net spellings (GND, GROUND, AGND, DGND, PGND, \
+             EARTH, 0V); 'differential_pair' detects nets paired by a recognized complementary \
+             suffix (_P/_N, _DP/_DM, _DP/_DN, _PLUS/_MINUS, or trailing +/-) where both halves \
+             exist on the board, e.g. USB_DP/USB_DM or CLK_P/CLK_N; everything else is 'signal'. \
+             Returns each net's class and, for detected pairs, the positive/negative net names.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":             { "type": "string" },
+                    "net_prefix_power":  { "type": "string", "description": "Override the power-net prefix; defaults to the effective config's naming_conventions.net_prefix_power" },
+                    "net_prefix_ground": { "type": "string", "description": "Override the ground-net prefix; defaults to the effective config's naming_conventions.net_prefix_ground" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_classify_nets(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
     ]
 }
+
+// ─── Geometry (check_route_collision) ──────────────────────────────────────────
+
+/// Distance in mm from point `p` to the segment `a`-`b`.
+fn point_segment_distance_mm(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-12 {
+        return ((p.0 - a.0).powi(2) + (p.1 - a.1).powi(2)).sqrt();
+    }
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0);
+    let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+    ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+}
+
+/// Signed area of the triangle a-b-c, used to test which side of line a-b
+/// point c falls on. Zero means collinear.
+fn orientation((ax, ay): (f64, f64), (bx, by): (f64, f64), (cx, cy): (f64, f64)) -> f64 {
+    (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+}
+
+/// Whether `p`, known collinear with `a`-`b`, lies within its bounding box.
+fn on_segment(a: (f64, f64), b: (f64, f64), p: (f64, f64)) -> bool {
+    const EPS: f64 = 1e-9;
+    p.0 >= a.0.min(b.0) - EPS
+        && p.0 <= a.0.max(b.0) + EPS
+        && p.1 >= a.1.min(b.1) - EPS
+        && p.1 <= a.1.max(b.1) + EPS
+}
+
+/// Whether segments `a1`-`a2` and `b1`-`b2` intersect or touch, including the
+/// collinear-overlap case.
+fn segments_intersect(a1: (f64, f64), a2: (f64, f64), b1: (f64, f64), b2: (f64, f64)) -> bool {
+    const EPS: f64 = 1e-9;
+    let d1 = orientation(b1, b2, a1);
+    let d2 = orientation(b1, b2, a2);
+    let d3 = orientation(a1, a2, b1);
+    let d4 = orientation(a1, a2, b2);
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+    {
+        return true;
+    }
+    (d1.abs() < EPS && on_segment(b1, b2, a1))
+        || (d2.abs() < EPS && on_segment(b1, b2, a2))
+        || (d3.abs() < EPS && on_segment(a1, a2, b1))
+        || (d4.abs() < EPS && on_segment(a1, a2, b2))
+}
+
+/// Minimum distance in mm between segments `a1`-`a2` and `b1`-`b2`; `0.0` when
+/// they intersect or touch.
+fn segment_segment_distance_mm(
+    a1: (f64, f64),
+    a2: (f64, f64),
+    b1: (f64, f64),
+    b2: (f64, f64),
+) -> f64 {
+    if segments_intersect(a1, a2, b1, b2) {
+        return 0.0;
+    }
+    point_segment_distance_mm(a1, b1, b2)
+        .min(point_segment_distance_mm(a2, b1, b2))
+        .min(point_segment_distance_mm(b1, a1, a2))
+        .min(point_segment_distance_mm(b2, a1, a2))
+}
+
+/// KiCad's stock Default netclass clearance (mm), used only when neither side
+/// of a checked pair resolves a clearance from `get_effective_routing_rules_in`
+/// — matching `kicad_default_class`'s `"clearance": 0.2` elsewhere in this file.
+const FALLBACK_CLEARANCE_MM: f64 = 0.2;
+
+/// The clearance required between two nets: the larger of whichever effective
+/// clearances are resolvable, or the KiCad stock default when neither is.
+fn required_clearance_mm(
+    rules: &konnect_ipc::IpcEffectiveRoutingRules,
+    net_a: &str,
+    net_b: &str,
+) -> f64 {
+    let a = rules.get(net_a).and_then(|r| r.clearance_mm);
+    let b = rules.get(net_b).and_then(|r| r.clearance_mm);
+    match (a, b) {
+        (Some(a), Some(b)) => a.max(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => FALLBACK_CLEARANCE_MM,
+    }
+}
+
+// ─── Handlers ─────────────────────────────────────────────────────────────────
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -367,6 +579,10 @@ async fn handle_route_trace(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_for_gate = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_for_gate, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -408,6 +624,9 @@ async fn handle_route_pad_to_pad(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let board_path = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_path, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -516,6 +735,10 @@ async fn handle_add_via(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_for_gate = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_for_gate, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_name = match require_str(args, "net_name") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),
@@ -1190,6 +1413,785 @@ async fn handle_query_traces(
     ))
 }
 
+async fn handle_delete_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+
+    let board_ipc = board.clone();
+    let uuid_ipc = uuid.clone();
+    let deleted = match with_board_ipc_classified(ctx, &board, move |client| {
+        client.delete_via_verified(&board_ipc, &uuid_ipc)
+    })
+    .await?
+    {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                error.message()
+            )))
+        }
+    };
+
+    let Some(via) = deleted else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed via on the requested board".to_string(),
+            },
+            "The requested UUID is not a via on the requested board. No board item was deleted.",
+        ));
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "deleted_uuid": via.uuid,
+        "deleted_type": "via",
+        "preimage": {
+            "uuid": via.uuid,
+            "net": via.net_name,
+            "position": { "x": via.position.x, "y": via.position.y },
+            "drill": via.drill,
+            "pad_diameter": via.pad_diameter,
+            "via_type": via.via_type
+        },
+        "postcondition": "absent_from_via_readback"
+    })))
+}
+
+#[cfg(test)]
+mod delete_via_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    /// A packed `kiapi.board.types.Via` Any, ready to hand back from a mock
+    /// `GetItems` response.
+    fn packed_via(uuid: &str, net_name: &str, net_code: i32, x: f64, y: f64) -> prost_types::Any {
+        let mut via = konnect_ipc::builders::build_via(net_name, net_code, x, y, 0.4, 0.8);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: uuid.to_string(),
+        });
+        konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via")
+    }
+
+    /// A packed `kiapi.board.types.Track` Any — used to prove a trace
+    /// segment's UUID is refused rather than silently deleted as a via, since
+    /// both share KiCad's KOT_PCB_TRACE family selector.
+    fn packed_track(uuid: &str) -> prost_types::Any {
+        let mut track =
+            konnect_ipc::builders::build_track("GND", 7, "F.Cu", 0.25, 0.0, 0.0, 1.0, 1.0);
+        track.id = Some(kiapi::common::types::Kiid {
+            value: uuid.to_string(),
+        });
+        konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track")
+    }
+
+    #[tokio::test]
+    async fn trace_and_missing_uuids_refuse_before_delete_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let original = b"(kicad_pcb (version 20260206))";
+        std::fs::write(&board, original).unwrap();
+        let delete_count = Arc::new(Mutex::new(0usize));
+        let delete_count_in_mock = delete_count.clone();
+        let track = packed_track("segment-1");
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![track.clone()],
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                *delete_count_in_mock.lock().unwrap() += 1;
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+
+        let ctx = ctx_talking_to(address);
+        // "segment-1" belongs to a trace, not a via: must refuse, not delete.
+        for uuid in ["segment-1", "missing-1"] {
+            let result = handle_delete_via(
+                &json!({ "board": board.to_string_lossy(), "uuid": uuid }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error, "{uuid} unexpectedly succeeded");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("stale_target"),
+                "wrong error for {uuid}"
+            );
+        }
+        assert_eq!(*delete_count.lock().unwrap(), 0);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn success_reports_the_observed_via_and_verified_postcondition() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let deleted = Arc::new(Mutex::new(false));
+        let deleted_in_mock = deleted.clone();
+        let packed = packed_via("via-1", "GND", 7, 1.0, 2.0);
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let items = if *deleted_in_mock.lock().unwrap() {
+                    vec![]
+                } else {
+                    vec![packed.clone()]
+                };
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("DeleteItems") {
+                *deleted_in_mock.lock().unwrap() = true;
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::DeleteItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        deleted_items: vec![],
+                    },
+                    "kiapi.common.commands.DeleteItemsResponse",
+                ));
+            }
+            None
+        });
+
+        let result = handle_delete_via(
+            &json!({ "board": board.to_string_lossy(), "uuid": "via-1" }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["deleted_uuid"], json!("via-1"));
+        assert_eq!(body["deleted_type"], json!("via"));
+        assert_eq!(body["preimage"]["net"], json!("GND"));
+        assert_eq!(body["preimage"]["position"], json!({ "x": 1.0, "y": 2.0 }));
+        assert_eq!(body["preimage"]["drill"], json!(0.4));
+        assert_eq!(body["preimage"]["pad_diameter"], json!(0.8));
+        assert_eq!(body["preimage"]["via_type"], json!("through"));
+        assert_eq!(body["postcondition"], json!("absent_from_via_readback"));
+    }
+}
+
+async fn handle_move_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x = match require_f64(args, "x") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y = match require_f64(args, "y") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+
+    let board_ipc = board.clone();
+    let uuid_ipc = uuid.clone();
+    let moved = match with_board_ipc_classified(ctx, &board, move |client| {
+        client.move_via_verified(&board_ipc, &uuid_ipc, x, y)
+    })
+    .await?
+    {
+        Ok(moved) => moved,
+        Err(error) => {
+            return Ok(CallToolResult::error(format!(
+                "KiCAD must be running with the board loaded (IPC error: {})",
+                error.message()
+            )))
+        }
+    };
+
+    let Some(via) = moved else {
+        return Ok(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "the UUID is not an observed via on the requested board".to_string(),
+            },
+            "The requested UUID is not a via on the requested board. No board item was moved.",
+        ));
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "moved_uuid": via.uuid,
+        "postimage": {
+            "uuid": via.uuid,
+            "net": via.net_name,
+            "position": { "x": via.position.x, "y": via.position.y },
+            "drill": via.drill,
+            "pad_diameter": via.pad_diameter,
+            "via_type": via.via_type
+        },
+        "postcondition": "position_verified_by_readback"
+    })))
+}
+
+#[cfg(test)]
+mod move_via_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+    use std::sync::{Arc, Mutex};
+
+    fn packed_via(uuid: &str, net_name: &str, net_code: i32, x: f64, y: f64) -> prost_types::Any {
+        let mut via = konnect_ipc::builders::build_via(net_name, net_code, x, y, 0.4, 0.8);
+        via.id = Some(kiapi::common::types::Kiid {
+            value: uuid.to_string(),
+        });
+        konnect_ipc::builders::pack_any(&via, "kiapi.board.types.Via")
+    }
+
+    fn packed_track(uuid: &str) -> prost_types::Any {
+        let mut track =
+            konnect_ipc::builders::build_track("GND", 7, "F.Cu", 0.25, 0.0, 0.0, 1.0, 1.0);
+        track.id = Some(kiapi::common::types::Kiid {
+            value: uuid.to_string(),
+        });
+        konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track")
+    }
+
+    #[tokio::test]
+    async fn trace_and_missing_uuids_refuse_before_update_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        let original = b"(kicad_pcb (version 20260206))";
+        std::fs::write(&board, original).unwrap();
+        let update_count = Arc::new(Mutex::new(0usize));
+        let update_count_in_mock = update_count.clone();
+        let track = packed_track("segment-1");
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![track.clone()],
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("UpdateItems") {
+                *update_count_in_mock.lock().unwrap() += 1;
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::UpdateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        updated_items: vec![],
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                ));
+            }
+            None
+        });
+
+        let ctx = ctx_talking_to(address);
+        for uuid in ["segment-1", "missing-1"] {
+            let result = handle_move_via(
+                &json!({ "board": board.to_string_lossy(), "uuid": uuid, "x": 5.0, "y": 6.0 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_error, "{uuid} unexpectedly succeeded");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("stale_target"),
+                "wrong error for {uuid}"
+            );
+        }
+        assert_eq!(*update_count.lock().unwrap(), 0);
+        assert_eq!(std::fs::read(&board).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn success_reports_the_verified_postimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let moved = Arc::new(Mutex::new(false));
+        let moved_in_mock = moved.clone();
+        let before = packed_via("via-1", "GND", 7, 1.0, 2.0);
+        let after = packed_via("via-1", "GND", 7, 5.0, 6.0);
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                let items = if *moved_in_mock.lock().unwrap() {
+                    vec![after.clone()]
+                } else {
+                    vec![before.clone()]
+                };
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items,
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("UpdateItems") {
+                *moved_in_mock.lock().unwrap() = true;
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::UpdateItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        updated_items: vec![kiapi::common::commands::ItemUpdateResult {
+                            status: Some(kiapi::common::commands::ItemStatus {
+                                code: kiapi::common::commands::ItemStatusCode::IscOk as i32,
+                                error_message: String::new(),
+                            }),
+                            item: None,
+                        }],
+                    },
+                    "kiapi.common.commands.UpdateItemsResponse",
+                ));
+            }
+            None
+        });
+
+        let result = handle_move_via(
+            &json!({ "board": board.to_string_lossy(), "uuid": "via-1", "x": 5.0, "y": 6.0 }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["moved_uuid"], json!("via-1"));
+        assert_eq!(body["postimage"]["position"], json!({ "x": 5.0, "y": 6.0 }));
+        assert_eq!(
+            body["postcondition"],
+            json!("position_verified_by_readback")
+        );
+    }
+}
+
+async fn handle_query_vias(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let net = args["net_name"].as_str().map(String::from);
+
+    let vias = ipc!(ctx, args, |c| { c.get_vias(net.as_deref()) });
+
+    let items: Vec<serde_json::Value> = vias
+        .iter()
+        .map(|v| {
+            json!({
+                "uuid": v.uuid,
+                "net": v.net_name,
+                "x": v.position.x, "y": v.position.y,
+                "drill": v.drill,
+                "pad_diameter": v.pad_diameter,
+                "via_type": v.via_type
+            })
+        })
+        .collect();
+
+    Ok(CallToolResult::json(
+        &json!({ "count": items.len(), "vias": items }),
+    ))
+}
+
+#[cfg(test)]
+mod query_vias_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+
+    #[tokio::test]
+    async fn lists_only_vias_filtered_by_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+
+        let mut gnd_via = konnect_ipc::builders::build_via("GND", 7, 1.0, 2.0, 0.4, 0.8);
+        gnd_via.id = Some(kiapi::common::types::Kiid {
+            value: "via-gnd".to_string(),
+        });
+        let mut pwr_via = konnect_ipc::builders::build_via("3V3", 9, 3.0, 4.0, 0.3, 0.6);
+        pwr_via.id = Some(kiapi::common::types::Kiid {
+            value: "via-pwr".to_string(),
+        });
+        let mut track =
+            konnect_ipc::builders::build_track("GND", 7, "F.Cu", 0.25, 0.0, 0.0, 1.0, 1.0);
+        track.id = Some(kiapi::common::types::Kiid {
+            value: "segment-1".to_string(),
+        });
+
+        let items = vec![
+            konnect_ipc::builders::pack_any(&gnd_via, "kiapi.board.types.Via"),
+            konnect_ipc::builders::pack_any(&pwr_via, "kiapi.board.types.Via"),
+            konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track"),
+        ];
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: items.clone(),
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            None
+        });
+        let ctx = ctx_talking_to(address);
+
+        let all = handle_query_vias(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!all.is_error);
+        let text = match all.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            body["count"],
+            json!(2),
+            "trace segment leaked into vias: {body}"
+        );
+
+        let filtered = handle_query_vias(
+            &json!({ "board": board.to_string_lossy(), "net_name": "3V3" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let text = match filtered.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["count"], json!(1));
+        assert_eq!(body["vias"][0]["uuid"], json!("via-pwr"));
+    }
+}
+
+async fn handle_check_route_collision(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let net_name = match require_str(args, "net_name") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let layer = match require_str(args, "layer") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+    let x1 = match require_f64(args, "x1") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y1 = match require_f64(args, "y1") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let x2 = match require_f64(args, "x2") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let y2 = match require_f64(args, "y2") {
+        Ok(v) => v,
+        Err(e) => return Ok(e),
+    };
+    let width = args["width"].as_f64().unwrap_or(0.25);
+
+    let layer_ipc = layer.clone();
+    let (tracks, vias, pads, rules) = ipc!(ctx, args, |c| {
+        let tracks = c.get_tracks(None, Some(layer_ipc.as_str()))?;
+        let vias = c.get_vias(None)?;
+        let pads = c.get_all_pads()?;
+        let rules = c.get_effective_routing_rules()?;
+        Ok::<_, anyhow::Error>((tracks, vias, pads, rules))
+    });
+
+    let half_width = width / 2.0;
+    let a1 = (x1, y1);
+    let a2 = (x2, y2);
+    let mut conflicts: Vec<serde_json::Value> = Vec::new();
+
+    for track in &tracks {
+        if track.net_name == net_name {
+            continue;
+        }
+        let required = required_clearance_mm(&rules, &net_name, &track.net_name);
+        let distance = segment_segment_distance_mm(
+            a1,
+            a2,
+            (track.start.x, track.start.y),
+            (track.end.x, track.end.y),
+        );
+        let found = distance - half_width - track.width / 2.0;
+        if found < required {
+            conflicts.push(json!({
+                "kind": "track",
+                "uuid": track.uuid,
+                "net": track.net_name,
+                "layer": track.layer,
+                "clearance_required_mm": required,
+                "clearance_found_mm": found
+            }));
+        }
+    }
+
+    for via in &vias {
+        if via.net_name == net_name {
+            continue;
+        }
+        let required = required_clearance_mm(&rules, &net_name, &via.net_name);
+        let distance = point_segment_distance_mm((via.position.x, via.position.y), a1, a2);
+        let found = distance - half_width - via.pad_diameter / 2.0;
+        if found < required {
+            conflicts.push(json!({
+                "kind": "via",
+                "uuid": via.uuid,
+                "net": via.net_name,
+                "clearance_required_mm": required,
+                "clearance_found_mm": found
+            }));
+        }
+    }
+
+    // Component pads: the gap this tool shipped with. A proposed trace was
+    // only ever checked against existing copper (tracks/vias), never against
+    // the pads sitting on the layer it would cross — on a dense board this
+    // let route_pad_to_pad draw straight through a neighbor's pad every time,
+    // undetected, because this was the only pre-flight check available.
+    // Pads are approximated as a circle of radius max(size_x, size_y)/2,
+    // matching how a via's pad_diameter is already treated as a circle above
+    // — conservative (never smaller than the real footprint) rather than
+    // exact, which is the right tradeoff for a pre-flight refuse-if-unsure
+    // check.
+    for board_pad in &pads {
+        let pad = &board_pad.pad;
+        if pad.net == net_name {
+            continue;
+        }
+        if pad.net.is_empty() {
+            continue;
+        }
+        if !pad.layers.iter().any(|l| l == &layer) {
+            continue;
+        }
+        let radius = pad.size_x.max(pad.size_y) / 2.0;
+        if radius <= 0.0 {
+            continue;
+        }
+        let required = required_clearance_mm(&rules, &net_name, &pad.net);
+        let distance = point_segment_distance_mm((pad.x, pad.y), a1, a2);
+        let found = distance - half_width - radius;
+        if found < required {
+            conflicts.push(json!({
+                "kind": "pad",
+                "reference": board_pad.reference,
+                "pad_number": pad.number,
+                "net": pad.net,
+                "clearance_required_mm": required,
+                "clearance_found_mm": found
+            }));
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "clear": conflicts.is_empty(),
+        "checked": { "tracks": tracks.len(), "vias": vias.len(), "pads": pads.len() },
+        "conflicts": conflicts
+    })))
+}
+
+#[cfg(test)]
+mod check_route_collision_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+
+    /// A mock KiCad holding one `GND` track from (0,0) to (10,0) on F.Cu and
+    /// no nets (so `get_effective_routing_rules` falls back to the stock
+    /// default clearance for every pair).
+    fn mock_with_one_track(board: &std::path::Path) -> String {
+        let mut track =
+            konnect_ipc::builders::build_track("GND", 7, "F.Cu", 0.25, 0.0, 0.0, 10.0, 0.0);
+        track.id = Some(kiapi::common::types::Kiid {
+            value: "segment-1".to_string(),
+        });
+        let packed = konnect_ipc::builders::pack_any(&track, "kiapi.board.types.Track");
+        spawn_kicad_holding_board(board, move |command| {
+            if command.type_url.ends_with("GetItems") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::common::commands::GetItemsResponse {
+                        header: None,
+                        status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                        items: vec![packed.clone()],
+                    },
+                    "kiapi.common.commands.GetItemsResponse",
+                ));
+            }
+            if command.type_url.ends_with("GetNets") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::NetsResponse { nets: vec![] },
+                    "kiapi.board.commands.NetsResponse",
+                ));
+            }
+            None
+        })
+    }
+
+    #[tokio::test]
+    async fn same_layer_overlapping_different_net_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let address = mock_with_one_track(&board);
+
+        // A proposed 3V3 trace crossing straight through the existing GND
+        // track at (5,0): must be refused.
+        let result = handle_check_route_collision(
+            &json!({
+                "board": board.to_string_lossy(),
+                "net_name": "3V3",
+                "layer": "F.Cu",
+                "x1": 5.0, "y1": -5.0,
+                "x2": 5.0, "y2": 5.0,
+                "width": 0.25
+            }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["clear"], json!(false));
+        assert_eq!(body["conflicts"].as_array().unwrap().len(), 1);
+        assert_eq!(body["conflicts"][0]["kind"], json!("track"));
+        assert_eq!(body["conflicts"][0]["uuid"], json!("segment-1"));
+        assert_eq!(body["conflicts"][0]["net"], json!("GND"));
+        // Segments cross: found clearance is deeply negative (full overlap).
+        assert!(body["conflicts"][0]["clearance_found_mm"].as_f64().unwrap() < 0.0);
+        assert_eq!(body["conflicts"][0]["clearance_required_mm"], json!(0.2));
+    }
+
+    #[tokio::test]
+    async fn a_genuinely_clear_path_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let address = mock_with_one_track(&board);
+
+        // A proposed 3V3 trace far away from the existing GND track (which
+        // spans y=0 from x=0..10): must be reported clear.
+        let result = handle_check_route_collision(
+            &json!({
+                "board": board.to_string_lossy(),
+                "net_name": "3V3",
+                "layer": "F.Cu",
+                "x1": 0.0, "y1": 20.0,
+                "x2": 10.0, "y2": 20.0,
+                "width": 0.25
+            }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["clear"], json!(true));
+        assert_eq!(body["conflicts"].as_array().unwrap().len(), 0);
+        assert_eq!(body["checked"]["tracks"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn same_net_overlap_is_not_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+        let address = mock_with_one_track(&board);
+
+        // Same net (GND) crossing the existing GND track: legitimately not a
+        // conflict — a router may deliberately extend/overlap its own net.
+        let result = handle_check_route_collision(
+            &json!({
+                "board": board.to_string_lossy(),
+                "net_name": "GND",
+                "layer": "F.Cu",
+                "x1": 5.0, "y1": -5.0,
+                "x2": 5.0, "y2": 5.0,
+                "width": 0.25
+            }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["clear"], json!(true));
+    }
+}
+
 async fn handle_get_nets_list(
     args: &serde_json::Value,
     ctx: &ToolContext,
@@ -1202,6 +2204,222 @@ async fn handle_get_nets_list(
     Ok(CallToolResult::json(
         &json!({ "count": items.len(), "nets": items }),
     ))
+}
+
+/// A recognized complementary suffix pair for differential-pair detection,
+/// e.g. `_DP`/`_DM` (USB_DP/USB_DM) or `_P`/`_N` (CLK_P/CLK_N). Matched
+/// case-insensitively against the uppercased net name.
+struct DiffPairPattern {
+    pos: &'static str,
+    neg: &'static str,
+}
+
+const DIFF_PAIR_PATTERNS: &[DiffPairPattern] = &[
+    DiffPairPattern {
+        pos: "_DP",
+        neg: "_DM",
+    },
+    DiffPairPattern {
+        pos: "_DP",
+        neg: "_DN",
+    },
+    DiffPairPattern {
+        pos: "_P",
+        neg: "_N",
+    },
+    DiffPairPattern {
+        pos: "_PLUS",
+        neg: "_MINUS",
+    },
+    DiffPairPattern { pos: "+", neg: "-" },
+];
+
+/// Ground-net spellings recognized beyond the configured `net_prefix_ground`,
+/// matched case-insensitively against the whole net name.
+const GROUND_NET_VARIANTS: &[&str] = &[
+    "GND", "GROUND", "AGND", "DGND", "PGND", "GNDA", "GNDD", "EARTH", "0V",
+];
+
+fn is_ground_net(name: &str, ground_prefix: &str) -> bool {
+    let upper = name.to_uppercase();
+    let prefix = ground_prefix.trim().to_uppercase();
+    (!prefix.is_empty() && upper == prefix) || GROUND_NET_VARIANTS.contains(&upper.as_str())
+}
+
+fn is_power_net(name: &str, power_prefix: &str) -> bool {
+    let prefix = power_prefix.trim().to_uppercase();
+    !prefix.is_empty() && name.to_uppercase().starts_with(&prefix)
+}
+
+async fn handle_classify_nets(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let nets = ipc!(ctx, args, |c| c.get_nets());
+
+    // Both prefixes may be overridden per-call; otherwise read from the
+    // merged user+project config, the same source get_effective_config
+    // reports.
+    let power_prefix = if let Some(v) = args["net_prefix_power"].as_str() {
+        v.to_string()
+    } else {
+        let config = crate::tools::config::effective_config_value(args, ctx).await;
+        config["naming_conventions"]["net_prefix_power"]
+            .as_str()
+            .unwrap_or("VCC_")
+            .to_string()
+    };
+    let ground_prefix = if let Some(v) = args["net_prefix_ground"].as_str() {
+        v.to_string()
+    } else {
+        let config = crate::tools::config::effective_config_value(args, ctx).await;
+        config["naming_conventions"]["net_prefix_ground"]
+            .as_str()
+            .unwrap_or("GND")
+            .to_string()
+    };
+
+    // Named nets only: KiCad's unconnected pseudo-net carries an empty name
+    // and is not a real net to classify.
+    let by_upper: std::collections::HashMap<String, String> = nets
+        .iter()
+        .filter(|n| !n.name.is_empty())
+        .map(|n| (n.name.to_uppercase(), n.name.clone()))
+        .collect();
+
+    let mut diff_pair_partner: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut pairs: Vec<serde_json::Value> = Vec::new();
+
+    for pattern in DIFF_PAIR_PATTERNS {
+        for (upper, original) in &by_upper {
+            let Some(base) = upper.strip_suffix(pattern.pos) else {
+                continue;
+            };
+            let candidate_upper = format!("{base}{}", pattern.neg);
+            let Some(partner_original) = by_upper.get(&candidate_upper) else {
+                continue;
+            };
+            diff_pair_partner.insert(original.clone(), partner_original.clone());
+            diff_pair_partner.insert(partner_original.clone(), original.clone());
+            pairs.push(json!({
+                "positive": original,
+                "negative": partner_original
+            }));
+        }
+    }
+
+    let items: Vec<serde_json::Value> = nets
+        .iter()
+        .filter(|n| !n.name.is_empty())
+        .map(|n| {
+            let class = if is_ground_net(&n.name, &ground_prefix) {
+                "ground"
+            } else if is_power_net(&n.name, &power_prefix) {
+                "power"
+            } else if diff_pair_partner.contains_key(&n.name) {
+                "differential_pair"
+            } else {
+                "signal"
+            };
+            json!({
+                "name": n.name,
+                "netcode": n.netcode,
+                "class": class,
+                "differential_partner": diff_pair_partner.get(&n.name)
+            })
+        })
+        .collect();
+
+    Ok(CallToolResult::json(&json!({
+        "count": items.len(),
+        "nets": items,
+        "differential_pairs": pairs
+    })))
+}
+
+#[cfg(test)]
+mod classify_nets_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{ctx_talking_to, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+
+    fn net(name: &str, code: i32) -> kiapi::board::types::Net {
+        kiapi::board::types::Net {
+            code: Some(kiapi::board::types::NetCode { value: code }),
+            name: name.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn classifies_power_ground_signal_and_detects_differential_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("target.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20260206))").unwrap();
+
+        let nets = vec![
+            net("GND", 1),
+            net("VCC_3V3", 2),
+            net("USB_DP", 3),
+            net("USB_DM", 4),
+            net("CLK_P", 5),
+            net("CLK_N", 6),
+            net("SPI_MOSI", 7),
+        ];
+        let address = spawn_kicad_holding_board(&board, move |command| {
+            if command.type_url.ends_with("GetNets") {
+                return Some(konnect_ipc::builders::pack_any(
+                    &kiapi::board::commands::NetsResponse { nets: nets.clone() },
+                    "kiapi.board.commands.NetsResponse",
+                ));
+            }
+            None
+        });
+
+        // Prefixes passed explicitly so the test is hermetic — independent
+        // of whatever naming_conventions a real ~/.konnect/config.json on
+        // the machine running the test happens to hold.
+        let result = handle_classify_nets(
+            &json!({
+                "board": board.to_string_lossy(),
+                "net_prefix_power": "VCC_",
+                "net_prefix_ground": "GND"
+            }),
+            &ctx_talking_to(address),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.is_error);
+        let text = match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
+            other => panic!("expected text result, got {other:?}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let class_of = |name: &str| {
+            body["nets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["name"] == json!(name))
+                .unwrap_or_else(|| panic!("net '{name}' missing from result: {body}"))["class"]
+                .clone()
+        };
+        assert_eq!(class_of("GND"), json!("ground"));
+        assert_eq!(class_of("VCC_3V3"), json!("power"));
+        assert_eq!(class_of("USB_DP"), json!("differential_pair"));
+        assert_eq!(class_of("USB_DM"), json!("differential_pair"));
+        assert_eq!(class_of("CLK_P"), json!("differential_pair"));
+        assert_eq!(class_of("CLK_N"), json!("differential_pair"));
+        assert_eq!(class_of("SPI_MOSI"), json!("signal"));
+
+        let pairs = body["differential_pairs"].as_array().unwrap();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "expected exactly USB and CLK pairs: {pairs:?}"
+        );
+    }
 }
 
 async fn handle_modify_trace(
@@ -1761,6 +2979,10 @@ async fn handle_route_diff_pair(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    let board_for_gate = get_path(args, "board")?;
+    if let Err(error) = require_phase_at_least(&board_for_gate, Phase::CriticalRouting).await {
+        return Ok(error);
+    }
     let net_pos = match require_str(args, "net_pos") {
         Ok(v) => v.to_string(),
         Err(e) => return Ok(e),

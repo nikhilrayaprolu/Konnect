@@ -226,7 +226,7 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
-async fn handle_run_drc(
+pub(crate) async fn handle_run_drc(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
